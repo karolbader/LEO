@@ -1,0 +1,6 @@
+# Optional metadata only.
+# cupola_repo = "E:\\CupolaCore"
+
+cupola_bin = "tools\\cupola\\cupola-cli.exe"
+aegis_bin = "tools\\aegis\\aegis.exe"
+epi_bin = "tools\\epi\\epi-cli.exe"

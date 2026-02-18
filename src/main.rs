@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use chrono::{SecondsFormat, Utc};
 use clap::{Args, Parser, Subcommand};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
@@ -31,12 +31,13 @@ const DRIFT_REPORT_FILE: &str = "epi.drift_report.v1.json";
 const DRIFT_MARKDOWN_FILE: &str = "DRIFT.md";
 const DECISION_PACK_MANIFEST_FILE: &str = "DecisionPack.manifest.json";
 const DECISION_PACK_HTML_FILE: &str = "DecisionPack.html";
+const QUOTE_JSON_FILE: &str = "Quote.json";
 const DECISION_PACK_ARTIFACT_BASENAMES: [&str; 8] = [
     DECISION_PACK_MANIFEST_FILE,
     "DecisionPack.seal.json",
     DECISION_PACK_HTML_FILE,
     "REPLAY.md",
-    "Quote.json",
+    QUOTE_JSON_FILE,
     "Quote.md",
     "DataShareChecklist.md",
     "cupola.manifest.json",
@@ -55,6 +56,17 @@ enum Commands {
     Run(RunArgs),
     Pack(PackArgs),
     Diff(DiffArgs),
+    Doctor(DoctorArgs),
+}
+
+#[derive(Args, Debug, Clone, Default)]
+struct ToolPathArgs {
+    #[arg(long)]
+    cupola_bin: Option<PathBuf>,
+    #[arg(long)]
+    aegis_bin: Option<PathBuf>,
+    #[arg(long)]
+    epi_bin: Option<PathBuf>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -65,14 +77,12 @@ struct RunArgs {
     intake: PathBuf,
     #[arg(long)]
     out: PathBuf,
-    #[arg(long, default_value = r"E:\CupolaCore")]
-    cupola_repo: PathBuf,
-    #[arg(long, default_value = r"E:\Sanctuary\products\aegis")]
-    aegis_repo: PathBuf,
     #[arg(long, default_value = "alpha")]
     query: String,
     #[arg(long, default_value_t = 20)]
     limit: u32,
+    #[command(flatten)]
+    tools: ToolPathArgs,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -83,14 +93,12 @@ struct PackArgs {
     intake: PathBuf,
     #[arg(long)]
     out: PathBuf,
-    #[arg(long, default_value = r"E:\CupolaCore")]
-    cupola_repo: PathBuf,
-    #[arg(long, default_value = r"E:\Sanctuary\products\aegis")]
-    aegis_repo: PathBuf,
     #[arg(long, default_value = "alpha")]
     query: String,
     #[arg(long, default_value_t = 20)]
     limit: u32,
+    #[command(flatten)]
+    tools: ToolPathArgs,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -104,6 +112,14 @@ struct DiffArgs {
     /// Output directory for epi.drift_report.v1.json.
     #[arg(long)]
     out: PathBuf,
+}
+
+#[derive(Args, Debug, Clone)]
+struct DoctorArgs {
+    #[arg(long)]
+    out: Option<PathBuf>,
+    #[command(flatten)]
+    tools: ToolPathArgs,
 }
 
 #[derive(Serialize)]
@@ -205,9 +221,21 @@ struct ClaimV1 {
     claim_id: String,
     title: String,
     status: String,
+    impact: String,
+    evidence: Vec<ClaimEvidenceRefV1>,
     evidence_refs: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     notes: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ClaimEvidenceRefV1 {
+    rel_path: String,
+    sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    artifact_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -217,6 +245,7 @@ struct DriftReportV1 {
     a_sha256: String,
     b_sha256: String,
     changes: Vec<DriftChange>,
+    drift_summary: DriftSummaryV1,
 }
 
 #[derive(Serialize)]
@@ -229,6 +258,8 @@ struct DriftChange {
     b_sha256: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     summary: Option<DriftJsonSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    affected_claims: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -240,6 +271,27 @@ struct DriftJsonSummary {
     b_count: Option<usize>,
 }
 
+#[derive(Serialize)]
+struct DriftSummaryV1 {
+    counts: DriftSummaryCounts,
+    claims_affected_count: usize,
+    by_impact: DriftSummaryByImpact,
+}
+
+#[derive(Serialize)]
+struct DriftSummaryCounts {
+    added: usize,
+    removed: usize,
+    modified: usize,
+}
+
+#[derive(Serialize)]
+struct DriftSummaryByImpact {
+    high: usize,
+    medium: usize,
+    low: usize,
+}
+
 #[derive(Clone)]
 struct ZipEntrySnapshot {
     sha256: String,
@@ -249,8 +301,21 @@ struct ZipEntrySnapshot {
 struct ClaimSeed {
     title: String,
     status: String,
-    evidence_refs: Vec<String>,
+    impact: String,
+    evidence_rel_paths: Vec<String>,
     notes: Option<String>,
+}
+
+struct DriftClaimRef {
+    claim_id: String,
+    impact: String,
+    evidence_rel_paths: Vec<String>,
+}
+
+struct ImpactedClaimSummary {
+    claim_id: String,
+    impact: String,
+    changed_paths: Vec<String>,
 }
 
 struct StepSpec {
@@ -265,10 +330,37 @@ struct BundleContext {
     pack_dir: PathBuf,
     vault: PathBuf,
     intake: PathBuf,
-    cupola_repo: PathBuf,
-    aegis_repo: PathBuf,
+    cupola_bin: PathBuf,
+    aegis_bin: PathBuf,
     query: String,
     limit: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct LeoConfig {
+    cupola_repo: Option<PathBuf>,
+    cupola_bin: Option<PathBuf>,
+    aegis_bin: Option<PathBuf>,
+    epi_bin: Option<PathBuf>,
+}
+
+#[derive(Clone)]
+struct ToolResolution {
+    tool_name: &'static str,
+    env_var: &'static str,
+    embedded_path: PathBuf,
+    selected_path: PathBuf,
+    selected_source: &'static str,
+    selected_exists: bool,
+}
+
+struct ResolvedTools {
+    leo_root: PathBuf,
+    config_path: PathBuf,
+    config: LeoConfig,
+    cupola: ToolResolution,
+    aegis: ToolResolution,
+    epi: ToolResolution,
 }
 
 fn main() {
@@ -284,10 +376,14 @@ fn run_cli() -> Result<()> {
         Commands::Run(args) => run(args),
         Commands::Pack(args) => pack_only(args),
         Commands::Diff(args) => diff(args),
+        Commands::Doctor(args) => doctor(args),
     }
 }
 
 fn run(args: RunArgs) -> Result<()> {
+    let tools = resolve_tools(&args.tools)?;
+    let cupola_bin = require_tool_binary(&tools.cupola)?;
+    let aegis_bin = require_tool_binary(&tools.aegis)?;
     let out_dir = absolutize(&args.out)?;
     ensure_outside_vault(&args.vault, &out_dir)?;
 
@@ -302,19 +398,12 @@ fn run(args: RunArgs) -> Result<()> {
         .with_context(|| format!("failed to create pack dir: {}", pack_dir.display()))?;
 
     let tool_versions = ToolVersions {
-        cupola_cli: probe_version(
-            &args.cupola_repo,
-            &["cargo", "run", "-p", "cupola-cli", "--", "--version"],
-        ),
-        aegis: probe_version(&args.aegis_repo, &["cargo", "run", "--", "--version"]),
+        cupola_cli: detect_tool_version(&cupola_bin),
+        aegis: detect_tool_version(&aegis_bin),
     };
 
     let cupola_argv = vec![
-        "cargo".to_string(),
-        "run".to_string(),
-        "-p".to_string(),
-        "cupola-cli".to_string(),
-        "--".to_string(),
+        path_to_string(&cupola_bin),
         "export-epi".to_string(),
         "--vault".to_string(),
         path_to_string(&args.vault),
@@ -327,9 +416,7 @@ fn run(args: RunArgs) -> Result<()> {
     ];
 
     let aegis_argv = vec![
-        "cargo".to_string(),
-        "run".to_string(),
-        "--".to_string(),
+        path_to_string(&aegis_bin),
         "run".to_string(),
         "--vault".to_string(),
         path_to_string(&args.vault),
@@ -338,13 +425,15 @@ fn run(args: RunArgs) -> Result<()> {
         "--out".to_string(),
         path_to_string(&pack_dir),
     ];
+    let cupola_cwd = command_working_dir_for_binary(&cupola_bin)?;
+    let aegis_cwd = command_working_dir_for_binary(&aegis_bin)?;
 
     let mut steps = Vec::new();
     let cupola_step = execute_step(
         StepSpec {
             step_id: "step-01-cupola-export-epi",
             tool: "cupola-cli",
-            cwd: args.cupola_repo.clone(),
+            cwd: cupola_cwd,
             argv: cupola_argv.clone(),
         },
         &out_dir,
@@ -358,7 +447,7 @@ fn run(args: RunArgs) -> Result<()> {
         StepSpec {
             step_id: "step-02-aegis-run",
             tool: "aegis",
-            cwd: args.aegis_repo.clone(),
+            cwd: aegis_cwd,
             argv: aegis_argv.clone(),
         },
         &out_dir,
@@ -395,8 +484,8 @@ fn run(args: RunArgs) -> Result<()> {
         pack_dir: pack_dir.clone(),
         vault: args.vault.clone(),
         intake: args.intake.clone(),
-        cupola_repo: args.cupola_repo.clone(),
-        aegis_repo: args.aegis_repo.clone(),
+        cupola_bin,
+        aegis_bin,
         query: args.query.clone(),
         limit: args.limit,
     };
@@ -410,6 +499,9 @@ fn run(args: RunArgs) -> Result<()> {
 }
 
 fn pack_only(args: PackArgs) -> Result<()> {
+    let tools = resolve_tools(&args.tools)?;
+    let cupola_bin = require_tool_binary(&tools.cupola)?;
+    let aegis_bin = require_tool_binary(&tools.aegis)?;
     let out_dir = absolutize(&args.out)?;
     ensure_outside_vault(&args.vault, &out_dir)?;
     let pack_dir = out_dir.join("pack");
@@ -422,8 +514,8 @@ fn pack_only(args: PackArgs) -> Result<()> {
         pack_dir,
         vault: args.vault,
         intake: args.intake,
-        cupola_repo: args.cupola_repo,
-        aegis_repo: args.aegis_repo,
+        cupola_bin,
+        aegis_bin,
         query: args.query,
         limit: args.limit,
     };
@@ -459,6 +551,307 @@ fn diff(args: DiffArgs) -> Result<()> {
         .with_context(|| format!("failed to write {}", DRIFT_MARKDOWN_FILE))?;
 
     Ok(())
+}
+
+fn doctor(args: DoctorArgs) -> Result<()> {
+    let default_out_dir = std::env::temp_dir().join("leo-doctor-out");
+    let out_dir = absolutize(args.out.as_ref().unwrap_or(&default_out_dir))?;
+    let tools = resolve_tools(&args.tools)?;
+    let exe_path = std::env::current_exe().context("failed to resolve current executable path")?;
+
+    println!("LEO Doctor");
+    println!("exe_path: {}", exe_path.display());
+    println!("leo_root: {}", tools.leo_root.display());
+    println!(
+        "config: {} ({})",
+        tools.config_path.display(),
+        if tools.config_path.exists() {
+            "present"
+        } else {
+            "missing"
+        }
+    );
+    if let Some(repo) = &tools.config.cupola_repo {
+        println!(
+            "config.cupola_repo: {}",
+            resolve_relative_to_root(&tools.leo_root, repo).display()
+        );
+    }
+
+    let mut failed = false;
+    failed |= print_writable_check("%TEMP%", &std::env::temp_dir());
+    failed |= print_writable_check("out_dir", &out_dir);
+    failed |= print_tool_check(&tools.cupola);
+    failed |= print_tool_check(&tools.aegis);
+    failed |= print_tool_check(&tools.epi);
+
+    if failed {
+        bail!("doctor checks failed");
+    }
+
+    println!("doctor: OK");
+    Ok(())
+}
+
+fn resolve_tools(args: &ToolPathArgs) -> Result<ResolvedTools> {
+    let leo_root = detect_leo_root()?;
+    let config_path = leo_root.join("config").join("leo.toml");
+    let config = load_leo_config(&config_path)?;
+
+    let cupola = resolve_tool_path(
+        "cupola-cli.exe",
+        "CUPOLA_CLI",
+        leo_root.join("tools").join("cupola").join("cupola-cli.exe"),
+        args.cupola_bin.as_ref(),
+        config.cupola_bin.as_ref(),
+        &leo_root,
+    );
+    let aegis = resolve_tool_path(
+        "aegis.exe",
+        "AEGIS_EXE",
+        leo_root.join("tools").join("aegis").join("aegis.exe"),
+        args.aegis_bin.as_ref(),
+        config.aegis_bin.as_ref(),
+        &leo_root,
+    );
+    let epi = resolve_tool_path(
+        "epi-cli.exe",
+        "EPI_CLI",
+        leo_root.join("tools").join("epi").join("epi-cli.exe"),
+        args.epi_bin.as_ref(),
+        config.epi_bin.as_ref(),
+        &leo_root,
+    );
+
+    Ok(ResolvedTools {
+        leo_root,
+        config_path,
+        config,
+        cupola,
+        aegis,
+        epi,
+    })
+}
+
+fn detect_leo_root() -> Result<PathBuf> {
+    let exe_path = std::env::current_exe().context("failed to resolve current executable path")?;
+    let parent = exe_path.parent().context(format!(
+        "failed to resolve executable parent directory: {}",
+        exe_path.display()
+    ))?;
+    Ok(parent.to_path_buf())
+}
+
+fn resolve_tool_path(
+    tool_name: &'static str,
+    env_var: &'static str,
+    embedded_path: PathBuf,
+    cli_override: Option<&PathBuf>,
+    config_path: Option<&PathBuf>,
+    leo_root: &Path,
+) -> ToolResolution {
+    let env_path = read_env_path(env_var);
+
+    if let Some(path) = cli_override {
+        let selected_path = resolve_relative_to_cwd(path);
+        return ToolResolution {
+            tool_name,
+            env_var,
+            embedded_path,
+            selected_path: selected_path.clone(),
+            selected_source: "cli",
+            selected_exists: selected_path.is_file(),
+        };
+    }
+
+    if embedded_path.is_file() {
+        return ToolResolution {
+            tool_name,
+            env_var,
+            embedded_path: embedded_path.clone(),
+            selected_path: embedded_path,
+            selected_source: "tools",
+            selected_exists: true,
+        };
+    }
+
+    if let Some(path) = config_path {
+        let selected_path = resolve_relative_to_root(leo_root, path);
+        if selected_path.is_file() {
+            return ToolResolution {
+                tool_name,
+                env_var,
+                embedded_path,
+                selected_path,
+                selected_source: "config",
+                selected_exists: true,
+            };
+        }
+    }
+
+    if let Some(path) = &env_path
+        && path.is_file()
+    {
+        return ToolResolution {
+            tool_name,
+            env_var,
+            embedded_path,
+            selected_path: path.clone(),
+            selected_source: "env",
+            selected_exists: true,
+        };
+    }
+
+    if let Some(path) = config_path {
+        let selected_path = resolve_relative_to_root(leo_root, path);
+        return ToolResolution {
+            tool_name,
+            env_var,
+            embedded_path,
+            selected_path: selected_path.clone(),
+            selected_source: "config",
+            selected_exists: selected_path.is_file(),
+        };
+    }
+
+    if let Some(path) = env_path {
+        return ToolResolution {
+            tool_name,
+            env_var,
+            embedded_path,
+            selected_path: path.clone(),
+            selected_source: "env",
+            selected_exists: path.is_file(),
+        };
+    }
+
+    ToolResolution {
+        tool_name,
+        env_var,
+        embedded_path: embedded_path.clone(),
+        selected_path: embedded_path.clone(),
+        selected_source: "tools",
+        selected_exists: embedded_path.is_file(),
+    }
+}
+
+fn read_env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+}
+
+fn resolve_relative_to_cwd(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return normalize_lexical(path);
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => normalize_lexical(&cwd.join(path)),
+        Err(_) => path.to_path_buf(),
+    }
+}
+
+fn resolve_relative_to_root(leo_root: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return normalize_lexical(path);
+    }
+    normalize_lexical(&leo_root.join(path))
+}
+
+fn load_leo_config(path: &Path) -> Result<LeoConfig> {
+    if !path.exists() {
+        return Ok(LeoConfig::default());
+    }
+
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("failed to read config file: {}", path.display()))?;
+    toml::from_str::<LeoConfig>(&raw)
+        .with_context(|| format!("failed to parse TOML config: {}", path.display()))
+}
+
+fn require_tool_binary(tool: &ToolResolution) -> Result<PathBuf> {
+    if tool.selected_exists {
+        return Ok(tool.selected_path.clone());
+    }
+
+    bail!(
+        "missing {} at {} (source={}, embedded={}, env={})",
+        tool.tool_name,
+        tool.selected_path.display(),
+        tool.selected_source,
+        tool.embedded_path.display(),
+        tool.env_var
+    );
+}
+
+fn print_writable_check(label: &str, path: &Path) -> bool {
+    match verify_writable_dir(path) {
+        Ok(()) => {
+            println!("{label}: {} [ok]", path.display());
+            false
+        }
+        Err(err) => {
+            println!("{label}: {} [error] {err:#}", path.display());
+            true
+        }
+    }
+}
+
+fn verify_writable_dir(path: &Path) -> Result<()> {
+    fs::create_dir_all(path)
+        .with_context(|| format!("failed to create directory for check: {}", path.display()))?;
+    let probe_path = path.join(format!(".leo-doctor-write-{}.tmp", Uuid::new_v4()));
+    fs::write(&probe_path, b"leo-doctor")
+        .with_context(|| format!("failed to write probe file: {}", probe_path.display()))?;
+    fs::remove_file(&probe_path)
+        .with_context(|| format!("failed to remove probe file: {}", probe_path.display()))?;
+    Ok(())
+}
+
+fn print_tool_check(tool: &ToolResolution) -> bool {
+    let embedded_ok = tool.embedded_path.is_file();
+    let selected_ok = tool.selected_exists;
+
+    println!(
+        "{}: selected={} (source={})",
+        tool.tool_name,
+        tool.selected_path.display(),
+        tool.selected_source
+    );
+    println!(
+        "  embedded={} [{}]",
+        tool.embedded_path.display(),
+        if embedded_ok { "ok" } else { "missing" }
+    );
+    println!(
+        "  selected={} [{}]",
+        tool.selected_path.display(),
+        if selected_ok { "ok" } else { "missing" }
+    );
+    println!("  env_var={}", tool.env_var);
+
+    if selected_ok {
+        let version = detect_tool_version(&tool.selected_path);
+        if let Some(commit) = extract_git_commit_hash(&version) {
+            println!("  version={version} (git={commit})");
+        } else {
+            println!("  version={version}");
+        }
+    } else {
+        println!("  version=unknown");
+    }
+
+    !(embedded_ok && selected_ok)
+}
+
+fn command_working_dir_for_binary(binary_path: &Path) -> Result<PathBuf> {
+    match binary_path.parent() {
+        Some(parent) => Ok(parent.to_path_buf()),
+        None => std::env::current_dir().context(format!(
+            "failed to resolve working directory for {}",
+            binary_path.display()
+        )),
+    }
 }
 
 fn execute_step(
@@ -562,8 +955,10 @@ fn write_supporting_epi_files(context: &BundleContext) -> Result<()> {
 fn build_claims_from_pack_dir(pack_dir: &Path) -> Result<ClaimsV1> {
     let manifest_rel = find_first_file_by_basename(pack_dir, DECISION_PACK_MANIFEST_FILE)?;
     let html_rel = find_first_file_by_basename(pack_dir, DECISION_PACK_HTML_FILE)?;
+    let quote_rel = find_first_file_by_basename(pack_dir, QUOTE_JSON_FILE)?;
     let manifest_ref = manifest_rel.as_ref().map(|path| normalize_rel_path(path));
     let html_ref = html_rel.as_ref().map(|path| normalize_rel_path(path));
+    let quote_ref = quote_rel.as_ref().map(|path| normalize_rel_path(path));
 
     let mut claim_seeds = if let Some(manifest_rel_path) = &manifest_rel {
         let manifest_path = pack_dir.join(manifest_rel_path);
@@ -594,33 +989,64 @@ fn build_claims_from_pack_dir(pack_dir: &Path) -> Result<ClaimsV1> {
         );
     }
 
+    if claim_seeds.is_empty()
+        && let Some(quote_rel_path) = &quote_rel
+    {
+        let quote_path = pack_dir.join(quote_rel_path);
+        let bytes = fs::read(&quote_path)
+            .with_context(|| format!("failed to read {}", quote_path.display()))?;
+        if let Ok(quote) = serde_json::from_slice::<Value>(&bytes) {
+            claim_seeds =
+                extract_claims_from_quote(&quote, quote_ref.as_deref().unwrap_or(QUOTE_JSON_FILE));
+        }
+    }
+
     if claim_seeds.is_empty() {
-        let mut evidence_refs = Vec::new();
+        let mut evidence_rel_paths = Vec::new();
         if let Some(manifest_ref) = &manifest_ref {
-            evidence_refs.push(manifest_ref.clone());
+            evidence_rel_paths.push(manifest_ref.clone());
         } else if let Some(html_ref) = &html_ref {
-            evidence_refs.push(html_ref.clone());
+            evidence_rel_paths.push(html_ref.clone());
+        } else if let Some(quote_ref) = &quote_ref {
+            evidence_rel_paths.push(quote_ref.clone());
         }
 
         claim_seeds.push(ClaimSeed {
-            title: "Claim 1".to_string(),
+            title: "Decision pack claim".to_string(),
             status: "unknown".to_string(),
-            evidence_refs,
+            impact: "low".to_string(),
+            evidence_rel_paths,
             notes: Some("No structured claims were found in DecisionPack artifacts.".to_string()),
         });
     }
 
-    let claims = claim_seeds
-        .into_iter()
-        .enumerate()
-        .map(|(idx, seed)| ClaimV1 {
-            claim_id: format!("CLAIM-{num:03}", num = idx + 1),
-            title: seed.title,
-            status: normalize_claim_status(&seed.status),
-            evidence_refs: stable_unique_sorted_strings(seed.evidence_refs),
-            notes: seed.notes,
-        })
-        .collect();
+    let pack_hashes = snapshot_hashes(pack_dir)?;
+    let mut claims = Vec::new();
+    for seed in claim_seeds {
+        let status = normalize_claim_status(&seed.status);
+        let impact = normalize_or_infer_claim_impact(&seed.impact, &seed.title, &status);
+        let evidence = resolve_claim_evidence(&seed.evidence_rel_paths, &pack_hashes);
+        let evidence_refs = if evidence.is_empty() {
+            stable_unique_sorted_strings(seed.evidence_rel_paths)
+        } else {
+            evidence
+                .iter()
+                .map(|item| item.rel_path.clone())
+                .collect::<Vec<String>>()
+        };
+        let primary_evidence_ref = evidence_refs.first().map(String::as_str).unwrap_or("");
+
+        claims.push(ClaimV1 {
+            claim_id: deterministic_claim_id(&seed.title, primary_evidence_ref),
+            title: normalize_claim_title(&seed.title),
+            status,
+            impact,
+            evidence,
+            evidence_refs,
+            notes: normalize_claim_notes(seed.notes),
+        });
+    }
+    sort_claims_deterministically(&mut claims);
 
     Ok(ClaimsV1 {
         schema_version: CLAIMS_SCHEMA.to_string(),
@@ -668,6 +1094,7 @@ fn build_self_drift_report(pack_dir: &Path) -> Result<DriftReportV1> {
         a_sha256: snapshot_sha.clone(),
         b_sha256: snapshot_sha,
         changes: Vec::new(),
+        drift_summary: build_drift_summary(&[], &[]),
     })
 }
 
@@ -710,15 +1137,22 @@ fn extract_claims_from_control_results(manifest: &Value, manifest_ref: &str) -> 
             .and_then(value_non_empty_string)
             .map(normalize_claim_status)
             .unwrap_or_else(|| "unknown".to_string());
-        let mut evidence_refs = extract_evidence_refs(control_result.get("evidence_refs"));
-        if evidence_refs.is_empty() {
-            evidence_refs.push(manifest_ref.to_string());
+        let impact = control_result
+            .get("impact")
+            .and_then(value_non_empty_string)
+            .map(normalize_claim_impact)
+            .unwrap_or_else(|| infer_claim_impact(&title, &status));
+        let mut evidence_rel_paths =
+            extract_evidence_rel_paths(control_result.get("evidence_refs"));
+        if evidence_rel_paths.is_empty() {
+            evidence_rel_paths.push(manifest_ref.to_string());
         }
 
         claims.push(ClaimSeed {
             title,
             status,
-            evidence_refs,
+            impact,
+            evidence_rel_paths,
             notes: Some(format!("control_id={control_id}")),
         });
     }
@@ -747,10 +1181,12 @@ fn extract_claims_from_intake(manifest: &Value, manifest_ref: &str) -> Vec<Claim
             Some(Value::Bool(true)) => "supported",
             _ => "unknown",
         };
+        let impact = infer_claim_impact(claim_key, status);
         claims.push(ClaimSeed {
             title: claim_key.to_string(),
             status: status.to_string(),
-            evidence_refs: vec![manifest_ref.to_string()],
+            impact,
+            evidence_rel_paths: vec![manifest_ref.to_string()],
             notes: Some("derived from intake.claims".to_string()),
         });
     }
@@ -774,15 +1210,18 @@ fn extract_claims_from_query_log(manifest: &Value, manifest_ref: &str) -> Vec<Cl
             .map(ToOwned::to_owned)
             .or_else(|| query_id.clone())
             .unwrap_or_else(|| format!("Query {}", idx + 1));
-        let mut evidence_refs = extract_evidence_refs(entry.get("evidence_refs"));
-        if evidence_refs.is_empty() {
-            evidence_refs.push(manifest_ref.to_string());
+        let mut evidence_rel_paths = extract_evidence_rel_paths(entry.get("evidence_refs"));
+        if evidence_rel_paths.is_empty() {
+            evidence_rel_paths.push(manifest_ref.to_string());
         }
+        let status = "unknown".to_string();
+        let impact = infer_claim_impact(&title, &status);
 
         claims.push(ClaimSeed {
             title,
-            status: "unknown".to_string(),
-            evidence_refs,
+            status,
+            impact,
+            evidence_rel_paths,
             notes: query_id.map(|value| format!("query_id={value}")),
         });
     }
@@ -793,14 +1232,45 @@ fn extract_claims_from_query_log(manifest: &Value, manifest_ref: &str) -> Vec<Cl
 fn extract_claims_from_html(html: &str, html_ref: &str) -> Vec<ClaimSeed> {
     let mut claims = Vec::new();
     for token in extract_code_tokens(html) {
+        let status = "unknown".to_string();
         claims.push(ClaimSeed {
-            title: token,
-            status: "unknown".to_string(),
-            evidence_refs: vec![html_ref.to_string()],
+            title: token.clone(),
+            status: status.clone(),
+            impact: infer_claim_impact(&token, &status),
+            evidence_rel_paths: vec![html_ref.to_string()],
             notes: Some("derived from DecisionPack.html".to_string()),
         });
     }
     claims
+}
+
+fn extract_claims_from_quote(quote: &Value, quote_ref: &str) -> Vec<ClaimSeed> {
+    let title = quote
+        .get("title")
+        .and_then(value_non_empty_string)
+        .or_else(|| quote.get("summary").and_then(value_non_empty_string))
+        .or_else(|| quote.get("quote_id").and_then(value_non_empty_string))
+        .or_else(|| quote.get("decision").and_then(value_non_empty_string))
+        .unwrap_or("Quote evidence available")
+        .to_string();
+    let status = quote
+        .get("status")
+        .and_then(value_non_empty_string)
+        .map(normalize_claim_status)
+        .unwrap_or_else(|| "unknown".to_string());
+    let impact = quote
+        .get("impact")
+        .and_then(value_non_empty_string)
+        .map(normalize_claim_impact)
+        .unwrap_or_else(|| infer_claim_impact(&title, &status));
+
+    vec![ClaimSeed {
+        title,
+        status,
+        impact,
+        evidence_rel_paths: vec![quote_ref.to_string()],
+        notes: Some("derived from Quote.json fallback".to_string()),
+    }]
 }
 
 fn extract_code_tokens(html: &str) -> Vec<String> {
@@ -856,46 +1326,244 @@ fn normalize_claim_status(status: &str) -> String {
     }
 }
 
-fn extract_evidence_refs(value: Option<&Value>) -> Vec<String> {
+fn normalize_claim_impact(impact: &str) -> String {
+    match impact.trim().to_ascii_lowercase().as_str() {
+        "high" | "critical" => "high".to_string(),
+        "medium" | "med" => "medium".to_string(),
+        "low" => "low".to_string(),
+        _ => "low".to_string(),
+    }
+}
+
+fn infer_claim_impact(title: &str, status: &str) -> String {
+    let title_key = title.to_ascii_lowercase();
+    let high_keywords = [
+        "identity",
+        "security",
+        "compliance",
+        "privacy",
+        "risk",
+        "ownership",
+        "access",
+        "encryption",
+        "legal",
+    ];
+    if high_keywords
+        .iter()
+        .any(|keyword| title_key.contains(keyword))
+    {
+        return "high".to_string();
+    }
+
+    match normalize_claim_status(status).as_str() {
+        "partial" | "unsupported" => "medium".to_string(),
+        _ => "low".to_string(),
+    }
+}
+
+fn normalize_or_infer_claim_impact(raw_impact: &str, title: &str, status: &str) -> String {
+    match raw_impact.trim().to_ascii_lowercase().as_str() {
+        "high" | "critical" | "medium" | "med" | "low" => normalize_claim_impact(raw_impact),
+        _ => infer_claim_impact(title, status),
+    }
+}
+
+fn normalize_claim_title(title: &str) -> String {
+    let normalized = title.split_whitespace().collect::<Vec<&str>>().join(" ");
+    if normalized.is_empty() {
+        return "Untitled claim".to_string();
+    }
+    if normalized.chars().count() <= 120 {
+        return normalized;
+    }
+    normalized.chars().take(120).collect()
+}
+
+fn normalize_claim_notes(notes: Option<String>) -> Option<String> {
+    notes
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn sort_claims_deterministically(claims: &mut [ClaimV1]) {
+    claims.sort_by(|left, right| {
+        left.claim_id
+            .to_ascii_lowercase()
+            .cmp(&right.claim_id.to_ascii_lowercase())
+            .then_with(|| left.claim_id.cmp(&right.claim_id))
+    });
+}
+
+fn deterministic_claim_id(title: &str, primary_evidence_rel_path: &str) -> String {
+    let title_key = normalize_claim_id_component(title);
+    let evidence_key = normalize_claim_id_component(primary_evidence_rel_path);
+    let digest = sha256_bytes(format!("{title_key}|{evidence_key}").as_bytes());
+    format!("CLAIM-{}", digest[..12].to_ascii_uppercase())
+}
+
+fn normalize_claim_id_component(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<&str>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn resolve_claim_evidence(
+    evidence_rel_paths: &[String],
+    pack_hashes: &BTreeMap<String, String>,
+) -> Vec<ClaimEvidenceRefV1> {
+    let mut evidence = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    for candidate in stable_unique_sorted_strings(evidence_rel_paths.to_vec()) {
+        let Some((rel_path, sha256)) = resolve_pack_rel_path(&candidate, pack_hashes) else {
+            continue;
+        };
+        let rel_key = normalize_rel_path_key(&rel_path);
+        if !seen.insert(rel_key) {
+            continue;
+        }
+        evidence.push(ClaimEvidenceRefV1 {
+            rel_path: rel_path.clone(),
+            sha256,
+            artifact_kind: infer_artifact_kind(&rel_path),
+            note: None,
+        });
+    }
+
+    if evidence.is_empty()
+        && let Some((rel_path, sha256)) = pack_hashes.iter().next()
+    {
+        evidence.push(ClaimEvidenceRefV1 {
+            rel_path: rel_path.clone(),
+            sha256: sha256.clone(),
+            artifact_kind: infer_artifact_kind(rel_path),
+            note: Some("fallback to first available pack artifact".to_string()),
+        });
+    }
+
+    evidence
+}
+
+fn resolve_pack_rel_path(
+    candidate: &str,
+    pack_hashes: &BTreeMap<String, String>,
+) -> Option<(String, String)> {
+    let candidate = sanitize_evidence_rel_path(candidate)?;
+    let candidate_key = normalize_rel_path_key(&candidate);
+    if candidate_key.is_empty() {
+        return None;
+    }
+
+    for (rel_path, sha256) in pack_hashes {
+        if normalize_rel_path_key(rel_path) == candidate_key {
+            return Some((rel_path.clone(), sha256.clone()));
+        }
+    }
+
+    let target_name = entry_file_name(&candidate_key).to_ascii_lowercase();
+    let mut matched: Option<(String, String)> = None;
+    for (rel_path, sha256) in pack_hashes {
+        if entry_file_name(rel_path).to_ascii_lowercase() != target_name {
+            continue;
+        }
+        if matched.is_some() {
+            return None;
+        }
+        matched = Some((rel_path.clone(), sha256.clone()));
+    }
+    matched
+}
+
+fn infer_artifact_kind(rel_path: &str) -> Option<String> {
+    let file_name = entry_file_name(rel_path);
+    if file_name.eq_ignore_ascii_case(DECISION_PACK_MANIFEST_FILE) {
+        return Some("decisionpack_manifest".to_string());
+    }
+    if file_name.eq_ignore_ascii_case(DECISION_PACK_HTML_FILE) {
+        return Some("decisionpack_html".to_string());
+    }
+    if file_name.eq_ignore_ascii_case(QUOTE_JSON_FILE) {
+        return Some("quote_json".to_string());
+    }
+
+    match Path::new(file_name)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+    {
+        Some(ext) if ext == "json" => Some("json".to_string()),
+        Some(ext) if ext == "md" => Some("markdown".to_string()),
+        Some(ext) if ext == "txt" => Some("text".to_string()),
+        _ => None,
+    }
+}
+
+fn extract_evidence_rel_paths(value: Option<&Value>) -> Vec<String> {
     let Some(items) = value.and_then(Value::as_array) else {
         return Vec::new();
     };
 
-    let mut evidence_refs = Vec::new();
+    let mut evidence_rel_paths = Vec::new();
     for item in items {
-        if let Some(evidence_ref) = evidence_ref_to_string(item) {
-            evidence_refs.push(evidence_ref);
+        if let Some(text) = value_non_empty_string(item)
+            && let Some(path) = sanitize_evidence_rel_path(text)
+        {
+            evidence_rel_paths.push(path);
+            continue;
+        }
+
+        if let Some(rel_path) = item
+            .as_object()
+            .and_then(|object| object.get("rel_path"))
+            .and_then(value_non_empty_string)
+            && let Some(path) = sanitize_evidence_rel_path(rel_path)
+        {
+            evidence_rel_paths.push(path);
         }
     }
 
-    stable_unique_sorted_strings(evidence_refs)
+    stable_unique_sorted_strings(evidence_rel_paths)
 }
 
-fn evidence_ref_to_string(value: &Value) -> Option<String> {
-    if let Some(text) = value_non_empty_string(value) {
-        return Some(text.to_string());
+fn sanitize_evidence_rel_path(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("raw_blob_id:")
+        || lower.starts_with("chunk_blob_id:")
+        || lower.starts_with("chunk_id:")
+        || lower.contains("://")
+    {
+        return None;
     }
 
-    let object = value.as_object()?;
-    if let Some(raw_blob_id) = object.get("raw_blob_id").and_then(value_non_empty_string) {
-        return Some(format!("raw_blob_id:{raw_blob_id}"));
+    let core = trimmed.split('#').next().unwrap_or("").trim();
+    if core.is_empty() {
+        return None;
     }
-    if let Some(chunk_blob_id) = object.get("chunk_blob_id").and_then(value_non_empty_string) {
-        return Some(format!("chunk_blob_id:{chunk_blob_id}"));
+    let normalized = core
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .trim_start_matches('/')
+        .trim_end_matches('/')
+        .to_string();
+    if normalized.is_empty() || normalized.contains(':') {
+        return None;
     }
-    if let Some(rel_path) = object.get("rel_path").and_then(value_non_empty_string) {
-        let start_line = object.get("start_line").and_then(Value::as_u64);
-        let end_line = object.get("end_line").and_then(Value::as_u64);
-        return Some(match (start_line, end_line) {
-            (Some(start), Some(end)) => format!("{rel_path}#L{start}-L{end}"),
-            _ => rel_path.to_string(),
-        });
-    }
-    if let Some(chunk_id) = object.get("chunk_id").and_then(value_non_empty_string) {
-        return Some(format!("chunk_id:{chunk_id}"));
-    }
+    Some(normalized)
+}
 
-    None
+fn normalize_rel_path_key(value: &str) -> String {
+    value
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .trim_start_matches('/')
+        .trim_end_matches('/')
+        .to_ascii_lowercase()
 }
 
 fn value_non_empty_string(value: &Value) -> Option<&str> {
@@ -936,12 +1604,18 @@ fn build_drift_report_from_snapshots(
     a_entries: &BTreeMap<String, ZipEntrySnapshot>,
     b_entries: &BTreeMap<String, ZipEntrySnapshot>,
 ) -> DriftReportV1 {
+    let drift_claims = collect_drift_claims_from_snapshots(a_entries, b_entries);
+    let mut changes = compute_drift_changes(a_entries, b_entries);
+    annotate_drift_changes_with_claims(&mut changes, &drift_claims);
+    let drift_summary = build_drift_summary(&changes, &drift_claims);
+
     DriftReportV1 {
         schema_version: DRIFT_REPORT_SCHEMA.to_string(),
         generated_at: now_rfc3339_utc(),
         a_sha256,
         b_sha256,
-        changes: compute_drift_changes(a_entries, b_entries),
+        changes,
+        drift_summary,
     }
 }
 
@@ -964,6 +1638,7 @@ fn compute_drift_changes(
                 a_sha256: None,
                 b_sha256: Some(b_entry.sha256.clone()),
                 summary: summarize_json_change(&entry_path, None, b_entry.summary_bytes.as_deref()),
+                affected_claims: Vec::new(),
             }),
             (Some(a_entry), None) => changes.push(DriftChange {
                 kind: "removed".to_string(),
@@ -971,6 +1646,7 @@ fn compute_drift_changes(
                 a_sha256: Some(a_entry.sha256.clone()),
                 b_sha256: None,
                 summary: summarize_json_change(&entry_path, a_entry.summary_bytes.as_deref(), None),
+                affected_claims: Vec::new(),
             }),
             (Some(a_entry), Some(b_entry)) if a_entry.sha256 != b_entry.sha256 => {
                 changes.push(DriftChange {
@@ -983,6 +1659,7 @@ fn compute_drift_changes(
                         a_entry.summary_bytes.as_deref(),
                         b_entry.summary_bytes.as_deref(),
                     ),
+                    affected_claims: Vec::new(),
                 });
             }
             _ => {}
@@ -991,6 +1668,216 @@ fn compute_drift_changes(
 
     sort_drift_changes_deterministically(&mut changes);
     changes
+}
+
+fn collect_drift_claims_from_snapshots(
+    a_entries: &BTreeMap<String, ZipEntrySnapshot>,
+    b_entries: &BTreeMap<String, ZipEntrySnapshot>,
+) -> Vec<DriftClaimRef> {
+    let mut claims = extract_drift_claims_from_zip_entries(b_entries);
+    if claims.is_empty() {
+        claims = extract_drift_claims_from_zip_entries(a_entries);
+    }
+    claims
+}
+
+fn impact_rank(impact: &str) -> u8 {
+    match normalize_claim_impact(impact).as_str() {
+        "high" => 3,
+        "medium" => 2,
+        _ => 1,
+    }
+}
+
+fn extract_drift_claims_from_zip_entries(
+    entries: &BTreeMap<String, ZipEntrySnapshot>,
+) -> Vec<DriftClaimRef> {
+    for (entry_path, snapshot) in entries {
+        if !entry_file_name(entry_path).eq_ignore_ascii_case(CLAIMS_FILE) {
+            continue;
+        }
+        let Some(bytes) = snapshot.summary_bytes.as_deref() else {
+            continue;
+        };
+        let Some(value) = parse_json_value(bytes) else {
+            continue;
+        };
+        return parse_claims_from_claims_file(&value);
+    }
+    Vec::new()
+}
+
+fn parse_claims_from_claims_file(value: &Value) -> Vec<DriftClaimRef> {
+    let Some(claims) = value.get("claims").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    let mut output = Vec::new();
+    for claim in claims {
+        let Some(claim_id) = claim
+            .get("claim_id")
+            .and_then(value_non_empty_string)
+            .map(ToOwned::to_owned)
+        else {
+            continue;
+        };
+        let title = claim
+            .get("title")
+            .and_then(value_non_empty_string)
+            .unwrap_or("Untitled claim");
+        let status = claim
+            .get("status")
+            .and_then(value_non_empty_string)
+            .unwrap_or("unknown");
+        let impact = claim
+            .get("impact")
+            .and_then(value_non_empty_string)
+            .map(normalize_claim_impact)
+            .unwrap_or_else(|| infer_claim_impact(title, status));
+        let evidence_rel_paths = extract_claim_evidence_paths_from_claim_value(claim);
+
+        output.push(DriftClaimRef {
+            claim_id,
+            impact,
+            evidence_rel_paths,
+        });
+    }
+
+    output.sort_by(|left, right| {
+        left.claim_id
+            .to_ascii_lowercase()
+            .cmp(&right.claim_id.to_ascii_lowercase())
+            .then_with(|| left.claim_id.cmp(&right.claim_id))
+    });
+    output
+}
+
+fn extract_claim_evidence_paths_from_claim_value(claim: &Value) -> Vec<String> {
+    let mut evidence_rel_paths = Vec::new();
+
+    if let Some(items) = claim.get("evidence").and_then(Value::as_array) {
+        for item in items {
+            if let Some(rel_path) = item.get("rel_path").and_then(value_non_empty_string)
+                && let Some(path) = sanitize_evidence_rel_path(rel_path)
+            {
+                evidence_rel_paths.push(path);
+            }
+        }
+    }
+
+    if let Some(items) = claim.get("evidence_refs").and_then(Value::as_array) {
+        for item in items {
+            if let Some(value) = value_non_empty_string(item)
+                && let Some(path) = sanitize_evidence_rel_path(value)
+            {
+                evidence_rel_paths.push(path);
+            }
+        }
+    }
+
+    stable_unique_sorted_strings(evidence_rel_paths)
+}
+
+fn annotate_drift_changes_with_claims(changes: &mut [DriftChange], claims: &[DriftClaimRef]) {
+    for change in changes {
+        let mut affected_claims = Vec::new();
+        for claim in claims {
+            if claim
+                .evidence_rel_paths
+                .iter()
+                .any(|evidence_path| paths_share_directory_tree(&change.entry_path, evidence_path))
+            {
+                affected_claims.push(claim.claim_id.clone());
+            }
+        }
+        change.affected_claims = stable_unique_sorted_strings(affected_claims);
+    }
+}
+
+fn paths_share_directory_tree(left: &str, right: &str) -> bool {
+    let left_key = normalize_rel_path_key(left);
+    let right_key = normalize_rel_path_key(right);
+    if left_key.is_empty() || right_key.is_empty() {
+        return false;
+    }
+
+    if left_key == right_key || is_parent_or_child_path(&left_key, &right_key) {
+        return true;
+    }
+
+    let left_parent = parent_rel_path(&left_key);
+    if !left_parent.is_empty() && is_parent_or_child_path(&left_parent, &right_key) {
+        return true;
+    }
+
+    let right_parent = parent_rel_path(&right_key);
+    !right_parent.is_empty() && is_parent_or_child_path(&left_key, &right_parent)
+}
+
+fn is_parent_or_child_path(left: &str, right: &str) -> bool {
+    left == right
+        || left.starts_with(&(right.to_string() + "/"))
+        || right.starts_with(&(left.to_string() + "/"))
+}
+
+fn parent_rel_path(path: &str) -> String {
+    path.rsplit_once('/')
+        .map(|(parent, _)| parent.to_string())
+        .unwrap_or_default()
+}
+
+fn build_drift_summary(changes: &[DriftChange], claims: &[DriftClaimRef]) -> DriftSummaryV1 {
+    let mut added = 0usize;
+    let mut removed = 0usize;
+    let mut modified = 0usize;
+    let mut affected_claim_ids = BTreeSet::new();
+    let mut claim_impact_by_id = BTreeMap::new();
+
+    for claim in claims {
+        claim_impact_by_id.insert(
+            claim.claim_id.to_ascii_lowercase(),
+            normalize_claim_impact(&claim.impact),
+        );
+    }
+
+    for change in changes {
+        match change.kind.as_str() {
+            "added" => added += 1,
+            "removed" => removed += 1,
+            "modified" => modified += 1,
+            _ => {}
+        }
+        for claim_id in &change.affected_claims {
+            affected_claim_ids.insert(claim_id.clone());
+        }
+    }
+
+    let mut by_impact = DriftSummaryByImpact {
+        high: 0,
+        medium: 0,
+        low: 0,
+    };
+    for claim_id in &affected_claim_ids {
+        match claim_impact_by_id
+            .get(&claim_id.to_ascii_lowercase())
+            .map(String::as_str)
+            .unwrap_or("low")
+        {
+            "high" => by_impact.high += 1,
+            "medium" => by_impact.medium += 1,
+            _ => by_impact.low += 1,
+        }
+    }
+
+    DriftSummaryV1 {
+        counts: DriftSummaryCounts {
+            added,
+            removed,
+            modified,
+        },
+        claims_affected_count: affected_claim_ids.len(),
+        by_impact,
+    }
 }
 
 fn sort_drift_changes_deterministically(changes: &mut [DriftChange]) {
@@ -1163,18 +2050,6 @@ fn entry_file_name(entry_path: &str) -> &str {
 }
 
 fn render_drift_markdown(report: &DriftReportV1, a_zip: &Path, b_zip: &Path) -> String {
-    let mut added = 0usize;
-    let mut removed = 0usize;
-    let mut modified = 0usize;
-    for change in &report.changes {
-        match change.kind.as_str() {
-            "added" => added += 1,
-            "removed" => removed += 1,
-            "modified" => modified += 1,
-            _ => {}
-        }
-    }
-
     let mut output = String::new();
     output.push_str("# Drift Report\n\n");
     output.push_str(&format!("- generated_at: `{}`\n", report.generated_at));
@@ -1184,7 +2059,19 @@ fn render_drift_markdown(report: &DriftReportV1, a_zip: &Path, b_zip: &Path) -> 
     output.push_str(&format!("- b_sha256: `{}`\n", report.b_sha256));
     output.push_str(&format!(
         "- totals: added={}, removed={}, modified={}\n",
-        added, removed, modified
+        report.drift_summary.counts.added,
+        report.drift_summary.counts.removed,
+        report.drift_summary.counts.modified
+    ));
+    output.push_str(&format!(
+        "- claims_affected: {}\n",
+        report.drift_summary.claims_affected_count
+    ));
+    output.push_str(&format!(
+        "- by_impact: high={}, medium={}, low={}\n",
+        report.drift_summary.by_impact.high,
+        report.drift_summary.by_impact.medium,
+        report.drift_summary.by_impact.low
     ));
 
     if report.changes.is_empty() {
@@ -1192,7 +2079,29 @@ fn render_drift_markdown(report: &DriftReportV1, a_zip: &Path, b_zip: &Path) -> 
         return output;
     }
 
-    output.push_str("\n## Changes\n");
+    let impacted_claims = collect_impacted_claim_summaries(a_zip, b_zip, &report.changes);
+    if impacted_claims.is_empty() {
+        output.push_str("\n## Top Impacted Claims\nNo affected claims were mapped.\n");
+    } else {
+        output.push_str("\n## Top Impacted Claims\n");
+        let max_claims = 10usize;
+        for claim in impacted_claims.iter().take(max_claims) {
+            output.push_str(&format!(
+                "- [{}] `{}` -> {}\n",
+                claim.impact.to_ascii_uppercase(),
+                claim.claim_id,
+                markdown_links_for_paths(&claim.changed_paths)
+            ));
+        }
+        if impacted_claims.len() > max_claims {
+            output.push_str(&format!(
+                "- ... and {} more impacted claims\n",
+                impacted_claims.len() - max_claims
+            ));
+        }
+    }
+
+    output.push_str("\n## Full Change List\n");
     for change in &report.changes {
         output.push_str(&format!(
             "- {} `{}`",
@@ -1213,10 +2122,90 @@ fn render_drift_markdown(report: &DriftReportV1, a_zip: &Path, b_zip: &Path) -> 
                 summary.metric, a_count, b_count
             ));
         }
+        if !change.affected_claims.is_empty() {
+            output.push_str(&format!(
+                " [affected_claims: {}]",
+                change
+                    .affected_claims
+                    .iter()
+                    .map(|claim_id| format!("`{claim_id}`"))
+                    .collect::<Vec<String>>()
+                    .join(", ")
+            ));
+        }
         output.push('\n');
     }
 
     output
+}
+
+fn collect_impacted_claim_summaries(
+    a_zip: &Path,
+    b_zip: &Path,
+    changes: &[DriftChange],
+) -> Vec<ImpactedClaimSummary> {
+    let Ok(a_entries) = read_zip_entry_snapshots(a_zip) else {
+        return Vec::new();
+    };
+    let Ok(b_entries) = read_zip_entry_snapshots(b_zip) else {
+        return Vec::new();
+    };
+    let claims = collect_drift_claims_from_snapshots(&a_entries, &b_entries);
+    if claims.is_empty() {
+        return Vec::new();
+    }
+
+    let mut impact_by_claim_id = BTreeMap::new();
+    for claim in &claims {
+        impact_by_claim_id.insert(
+            claim.claim_id.to_ascii_lowercase(),
+            normalize_claim_impact(&claim.impact),
+        );
+    }
+
+    let mut changed_paths_by_claim_id: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for change in changes {
+        for claim_id in &change.affected_claims {
+            changed_paths_by_claim_id
+                .entry(claim_id.clone())
+                .or_default()
+                .push(change.entry_path.clone());
+        }
+    }
+
+    let mut output = Vec::new();
+    for (claim_id, changed_paths) in changed_paths_by_claim_id {
+        let impact = impact_by_claim_id
+            .get(&claim_id.to_ascii_lowercase())
+            .cloned()
+            .unwrap_or_else(|| "low".to_string());
+        output.push(ImpactedClaimSummary {
+            claim_id,
+            impact,
+            changed_paths: stable_unique_sorted_strings(changed_paths),
+        });
+    }
+
+    output.sort_by(|left, right| {
+        impact_rank(&right.impact)
+            .cmp(&impact_rank(&left.impact))
+            .then_with(|| {
+                left.claim_id
+                    .to_ascii_lowercase()
+                    .cmp(&right.claim_id.to_ascii_lowercase())
+            })
+            .then_with(|| left.claim_id.cmp(&right.claim_id))
+    });
+
+    output
+}
+
+fn markdown_links_for_paths(paths: &[String]) -> String {
+    paths
+        .iter()
+        .map(|path| format!("[{path}]({path})"))
+        .collect::<Vec<String>>()
+        .join(", ")
 }
 
 fn is_zip_path(path: &Path) -> bool {
@@ -1227,11 +2216,7 @@ fn is_zip_path(path: &Path) -> bool {
 
 fn build_replay_commands(context: &BundleContext) -> Vec<String> {
     let cupola = vec![
-        "cargo".to_string(),
-        "run".to_string(),
-        "-p".to_string(),
-        "cupola-cli".to_string(),
-        "--".to_string(),
+        path_to_string(&context.cupola_bin),
         "export-epi".to_string(),
         "--vault".to_string(),
         path_to_string(&context.vault),
@@ -1244,9 +2229,7 @@ fn build_replay_commands(context: &BundleContext) -> Vec<String> {
     ];
 
     let aegis = vec![
-        "cargo".to_string(),
-        "run".to_string(),
-        "--".to_string(),
+        path_to_string(&context.aegis_bin),
         "run".to_string(),
         "--vault".to_string(),
         path_to_string(&context.vault),
@@ -1265,10 +2248,10 @@ fn build_replay_commands(context: &BundleContext) -> Vec<String> {
         path_to_string(&context.intake),
         "--out".to_string(),
         path_to_string(&context.out_dir),
-        "--cupola-repo".to_string(),
-        path_to_string(&context.cupola_repo),
-        "--aegis-repo".to_string(),
-        path_to_string(&context.aegis_repo),
+        "--cupola-bin".to_string(),
+        path_to_string(&context.cupola_bin),
+        "--aegis-bin".to_string(),
+        path_to_string(&context.aegis_bin),
         "--query".to_string(),
         context.query.clone(),
         "--limit".to_string(),
@@ -1300,13 +2283,8 @@ fn run_command_capture(cwd: &Path, argv: &[String]) -> Result<std::process::Outp
         })
 }
 
-fn probe_version(cwd: &Path, argv: &[&str]) -> String {
-    let (program, args) = match argv.split_first() {
-        Some(value) => value,
-        None => return "unknown".to_string(),
-    };
-
-    let output = Command::new(program).args(args).current_dir(cwd).output();
+fn probe_version(program: &Path, args: &[&str]) -> String {
+    let output = Command::new(program).args(args).output();
     let output = match output {
         Ok(value) => value,
         Err(_) => return "unknown".to_string(),
@@ -1316,6 +2294,24 @@ fn probe_version(cwd: &Path, argv: &[&str]) -> String {
     }
 
     extract_first_non_empty_line(&output.stdout).unwrap_or_else(|| "unknown".to_string())
+}
+
+fn detect_tool_version(program: &Path) -> String {
+    let version = probe_version(program, &["--version"]);
+    if version != "unknown" {
+        return version;
+    }
+    probe_version(program, &["version"])
+}
+
+fn extract_git_commit_hash(version: &str) -> Option<String> {
+    version
+        .split(|ch: char| !ch.is_ascii_hexdigit())
+        .find(|token| {
+            let len = token.len();
+            (7..=40).contains(&len) && token.chars().any(|ch| ch.is_ascii_alphabetic())
+        })
+        .map(|token| token.to_ascii_lowercase())
 }
 
 fn extract_first_non_empty_line(bytes: &[u8]) -> Option<String> {
@@ -1649,12 +2645,16 @@ mod tests {
     }
 
     #[test]
-    fn claims_extraction_from_manifest_has_schema_and_claims() -> Result<()> {
+    fn claims_extraction_is_deterministic_and_has_structured_evidence() -> Result<()> {
         let temp_root = std::env::temp_dir().join(format!("leo-test-claims-{}", Uuid::new_v4()));
         let result = (|| -> Result<()> {
             let pack_dir = temp_root.join("pack");
             let decision_pack_dir = pack_dir.join("acme").join("eng42").join("PACK-001");
             fs::create_dir_all(&decision_pack_dir)?;
+            fs::write(
+                decision_pack_dir.join("notes.md"),
+                "ownership is with platform team",
+            )?;
 
             let manifest = json!({
                 "schema_version": "aegis.manifest.v1.1",
@@ -1678,12 +2678,46 @@ mod tests {
                 &manifest,
             )?;
 
-            let claims = build_claims_from_pack_dir(&pack_dir)?;
-            assert_eq!(claims.schema_version, CLAIMS_SCHEMA);
-            assert!(!claims.claims.is_empty());
-            assert_eq!(claims.claims[0].claim_id, "CLAIM-001");
-            assert_eq!(claims.claims[0].status, "supported");
-            assert!(!claims.claims[0].evidence_refs.is_empty());
+            let claims_run_a = build_claims_from_pack_dir(&pack_dir)?;
+            let claims_run_b = build_claims_from_pack_dir(&pack_dir)?;
+            assert_eq!(claims_run_a.schema_version, CLAIMS_SCHEMA);
+            assert!(!claims_run_a.claims.is_empty());
+
+            let claim_ids_a: Vec<String> = claims_run_a
+                .claims
+                .iter()
+                .map(|claim| claim.claim_id.clone())
+                .collect();
+            let claim_ids_b: Vec<String> = claims_run_b
+                .claims
+                .iter()
+                .map(|claim| claim.claim_id.clone())
+                .collect();
+            assert_eq!(claim_ids_a, claim_ids_b);
+
+            let mut sorted_ids = claim_ids_a.clone();
+            sort_strings_deterministically(&mut sorted_ids);
+            assert_eq!(claim_ids_a, sorted_ids);
+
+            let first_claim = &claims_run_a.claims[0];
+            assert_eq!(first_claim.status, "supported");
+            assert_eq!(first_claim.impact, "high");
+            assert!(!first_claim.evidence.is_empty());
+            assert!(!first_claim.evidence_refs.is_empty());
+            assert_eq!(
+                first_claim.evidence[0].rel_path,
+                first_claim.evidence_refs[0]
+            );
+            assert!(!first_claim.evidence[0].sha256.is_empty());
+
+            let claim_id_suffix = first_claim
+                .claim_id
+                .strip_prefix("CLAIM-")
+                .unwrap_or_default();
+            assert_eq!(claim_id_suffix.len(), 12);
+            assert!(claim_id_suffix.chars().all(|ch| {
+                ch.is_ascii_hexdigit() && (!ch.is_ascii_alphabetic() || ch.is_ascii_uppercase())
+            }));
 
             Ok(())
         })();
@@ -1768,6 +2802,153 @@ mod tests {
             &empty,
         );
         assert_eq!(report.schema_version, DRIFT_REPORT_SCHEMA);
+        assert_eq!(report.drift_summary.counts.added, 0);
+        assert_eq!(report.drift_summary.claims_affected_count, 0);
+    }
+
+    #[test]
+    fn drift_affected_claims_include_parent_child_and_are_sorted() {
+        let claims_json = json!({
+            "schema_version": CLAIMS_SCHEMA,
+            "generated_at": "2026-02-18T00:00:00Z",
+            "claims": [
+                {
+                    "claim_id": "CLAIM-ZETA",
+                    "title": "Policy is present",
+                    "status": "supported",
+                    "impact": "high",
+                    "evidence": [
+                        {"rel_path": "evidence/team/docs/policy.md", "sha256": "hash-zeta"}
+                    ],
+                    "evidence_refs": ["evidence/team/docs/policy.md"]
+                },
+                {
+                    "claim_id": "CLAIM-BETA",
+                    "title": "Data input is controlled",
+                    "status": "supported",
+                    "impact": "low",
+                    "evidence": [
+                        {"rel_path": "team/data/input.json", "sha256": "hash-beta"}
+                    ],
+                    "evidence_refs": ["team/data/input.json"]
+                },
+                {
+                    "claim_id": "CLAIM-ALPHA",
+                    "title": "Docs directory is stable",
+                    "status": "partial",
+                    "impact": "medium",
+                    "evidence": [
+                        {"rel_path": "evidence/team/docs", "sha256": "hash-alpha"}
+                    ],
+                    "evidence_refs": ["evidence/team/docs"]
+                }
+            ]
+        });
+        let claims_bytes = serde_json::to_vec(&claims_json).expect("claims json must serialize");
+
+        let mut a_entries = BTreeMap::new();
+        a_entries.insert(
+            "evidence/team/docs/policy.md".to_string(),
+            ZipEntrySnapshot {
+                sha256: "old-policy".to_string(),
+                summary_bytes: None,
+            },
+        );
+        a_entries.insert(
+            "team/data/input.json".to_string(),
+            ZipEntrySnapshot {
+                sha256: "stable-input".to_string(),
+                summary_bytes: None,
+            },
+        );
+        a_entries.insert(
+            CLAIMS_FILE.to_string(),
+            ZipEntrySnapshot {
+                sha256: "claims-hash".to_string(),
+                summary_bytes: Some(claims_bytes.clone()),
+            },
+        );
+
+        let mut b_entries = BTreeMap::new();
+        b_entries.insert(
+            "evidence/team/docs/appendix.md".to_string(),
+            ZipEntrySnapshot {
+                sha256: "new-appendix".to_string(),
+                summary_bytes: None,
+            },
+        );
+        b_entries.insert(
+            "evidence/team/docs/policy.md".to_string(),
+            ZipEntrySnapshot {
+                sha256: "new-policy".to_string(),
+                summary_bytes: None,
+            },
+        );
+        b_entries.insert(
+            "team/data/input.json".to_string(),
+            ZipEntrySnapshot {
+                sha256: "stable-input".to_string(),
+                summary_bytes: None,
+            },
+        );
+        b_entries.insert(
+            "team/data/input.json/segments/part-1.txt".to_string(),
+            ZipEntrySnapshot {
+                sha256: "child-change".to_string(),
+                summary_bytes: None,
+            },
+        );
+        b_entries.insert(
+            "unrelated/new.txt".to_string(),
+            ZipEntrySnapshot {
+                sha256: "other-change".to_string(),
+                summary_bytes: None,
+            },
+        );
+        b_entries.insert(
+            CLAIMS_FILE.to_string(),
+            ZipEntrySnapshot {
+                sha256: "claims-hash".to_string(),
+                summary_bytes: Some(claims_bytes),
+            },
+        );
+
+        let report = build_drift_report_from_snapshots(
+            "a-hash".to_string(),
+            "b-hash".to_string(),
+            &a_entries,
+            &b_entries,
+        );
+
+        let mut affected_by_path = BTreeMap::new();
+        for change in &report.changes {
+            affected_by_path.insert(change.entry_path.clone(), change.affected_claims.clone());
+        }
+
+        assert_eq!(
+            affected_by_path.get("evidence/team/docs/appendix.md"),
+            Some(&vec!["CLAIM-ALPHA".to_string(), "CLAIM-ZETA".to_string()])
+        );
+        assert_eq!(
+            affected_by_path.get("evidence/team/docs/policy.md"),
+            Some(&vec!["CLAIM-ALPHA".to_string(), "CLAIM-ZETA".to_string()])
+        );
+        assert_eq!(
+            affected_by_path.get("team/data/input.json/segments/part-1.txt"),
+            Some(&vec!["CLAIM-BETA".to_string()])
+        );
+        assert_eq!(
+            affected_by_path.get("unrelated/new.txt"),
+            Some(&Vec::<String>::new())
+        );
+
+        assert_eq!(report.drift_summary.counts.added, 3);
+        assert_eq!(report.drift_summary.counts.modified, 1);
+        assert_eq!(report.drift_summary.counts.removed, 0);
+        assert_eq!(report.drift_summary.claims_affected_count, 3);
+        assert_eq!(report.drift_summary.by_impact.high, 1);
+        assert_eq!(report.drift_summary.by_impact.medium, 1);
+        assert_eq!(report.drift_summary.by_impact.low, 1);
     }
 
     fn zip_entry_count(zip_path: &Path) -> Result<usize> {
