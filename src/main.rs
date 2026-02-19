@@ -331,6 +331,7 @@ struct BundleContext {
     vault: PathBuf,
     intake: PathBuf,
     cupola_bin: PathBuf,
+    cupola_repo: PathBuf,
     aegis_bin: PathBuf,
     query: String,
     limit: u32,
@@ -385,6 +386,7 @@ fn run(args: RunArgs) -> Result<()> {
     let cupola_bin = require_tool_binary(&tools.cupola)?;
     let aegis_bin = require_tool_binary(&tools.aegis)?;
     let out_dir = absolutize(&args.out)?;
+    let cupola_repo_for_aegis = resolve_cupola_repo_for_aegis(&cupola_bin);
     ensure_outside_vault(&args.vault, &out_dir)?;
 
     fs::create_dir_all(&out_dir)
@@ -420,6 +422,8 @@ fn run(args: RunArgs) -> Result<()> {
         "run".to_string(),
         "--vault".to_string(),
         path_to_string(&args.vault),
+        "--cupola-repo".to_string(),
+        path_to_string(&cupola_repo_for_aegis),
         "--intake".to_string(),
         path_to_string(&args.intake),
         "--out".to_string(),
@@ -485,6 +489,7 @@ fn run(args: RunArgs) -> Result<()> {
         vault: args.vault.clone(),
         intake: args.intake.clone(),
         cupola_bin,
+        cupola_repo: cupola_repo_for_aegis,
         aegis_bin,
         query: args.query.clone(),
         limit: args.limit,
@@ -503,6 +508,7 @@ fn pack_only(args: PackArgs) -> Result<()> {
     let cupola_bin = require_tool_binary(&tools.cupola)?;
     let aegis_bin = require_tool_binary(&tools.aegis)?;
     let out_dir = absolutize(&args.out)?;
+    let cupola_repo_for_aegis = resolve_cupola_repo_for_aegis(&cupola_bin);
     ensure_outside_vault(&args.vault, &out_dir)?;
     let pack_dir = out_dir.join("pack");
     if !pack_dir.exists() {
@@ -515,6 +521,7 @@ fn pack_only(args: PackArgs) -> Result<()> {
         vault: args.vault,
         intake: args.intake,
         cupola_bin,
+        cupola_repo: cupola_repo_for_aegis,
         aegis_bin,
         query: args.query,
         limit: args.limit,
@@ -852,6 +859,28 @@ fn command_working_dir_for_binary(binary_path: &Path) -> Result<PathBuf> {
             binary_path.display()
         )),
     }
+}
+
+fn resolve_cupola_repo_for_aegis(cupola_bin: &Path) -> PathBuf {
+    let Some(binary_dir) = cupola_bin.parent() else {
+        return PathBuf::from(".");
+    };
+
+    let is_release_dir = binary_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("release"));
+    if is_release_dir && let Some(target_dir) = binary_dir.parent() {
+        let is_target_dir = target_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("target"));
+        if is_target_dir && let Some(repo_root) = target_dir.parent() {
+            return repo_root.to_path_buf();
+        }
+    }
+
+    binary_dir.to_path_buf()
 }
 
 fn execute_step(
@@ -2233,6 +2262,8 @@ fn build_replay_commands(context: &BundleContext) -> Vec<String> {
         "run".to_string(),
         "--vault".to_string(),
         path_to_string(&context.vault),
+        "--cupola-repo".to_string(),
+        path_to_string(&context.cupola_repo),
         "--intake".to_string(),
         path_to_string(&context.intake),
         "--out".to_string(),

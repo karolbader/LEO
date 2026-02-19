@@ -11,6 +11,8 @@ LEO resolves tools from the folder that contains `leo.exe`:
 - `tools\aegis\aegis.exe`
 - `tools\aegis\data\...` (Aegis control packs)
 - `config\leo.toml`
+- `data\intake.json`
+- `scripts\smoke_e2e.ps1`
 
 Tool lookup order:
 
@@ -23,14 +25,30 @@ Tool lookup order:
 1. Unzip the portable folder.
 2. Open PowerShell in the folder containing `leo.exe`.
 3. Run `.\leo.exe doctor`.
-4. Run:
-   - `.\leo.exe run --vault "E:\Sanctuary\products\aegis" --intake "<path-to-intake.json>" --out "E:\_packs\LEO-<ts>"`
+4. Run the quick smoke:
+   - `pwsh -File .\scripts\smoke_e2e.ps1`
 
-## Verify Output Pack
+## Quick Smoke
 
-- `.\tools\epi\epi-cli.exe verify "<out>\pack.zip"`
+`smoke_e2e.ps1` performs a self-contained rail smoke:
+
+- creates a synthetic vault in `%TEMP%\leo-smoke\vault\...`
+- writes output to `%TEMP%\leo-smoke\run-...`
+- runs `leo.exe doctor`
+- runs `leo.exe run --vault ... --intake .\data\intake.json --out ...`
+- runs `tools\epi\epi-cli.exe verify <out>\pack.zip --json`
+
+The script prints one line:
+
+- `PASS <verify-json>` on success
+- `FAIL <reason>` on failure (exit code non-zero)
+
+## Verify Output Pack (Manual)
+
+- `.\tools\epi\epi-cli.exe verify "<out>\pack.zip" --json`
 
 ## Notes
 
 - No network calls are required.
 - Deterministic pack behavior is unchanged.
+
