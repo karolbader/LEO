@@ -47,8 +47,33 @@ The script prints one line:
 
 - `.\tools\epi\epi-cli.exe verify "<out>\pack.zip" --json`
 
+## Demo PDF Smoke
+
+Single command:
+
+- `pwsh -ExecutionPolicy Bypass -File E:\Sanctuary\products\leo\scripts\generate_demo_packs.ps1`
+
+This generates three demo outputs:
+
+- `E:\_packs\DEMO_vendorsecurity-v1_PACK-001`
+- `E:\_packs\DEMO_dfir-lite-v1_PACK-001`
+- `E:\_packs\DEMO_iso27001-lite-v1_PACK-001`
+
+Each output includes:
+
+- `pack.zip`
+- `verify.json`
+- `pack\epi.*.json`
+- `pack\<client>\<engagement>\PACK-001\DecisionPack.html`
+- `pack\<client>\<engagement>\PACK-001\DecisionPack.pdf`
+- `pack\<client>\<engagement>\PACK-001\SHA256.txt` (SHA256 of `DecisionPack.pdf`)
+
 ## Notes
 
 - No network calls are required.
 - Deterministic pack behavior is unchanged.
+- Chromium PDF metadata fields may vary by render run:
+  - `/CreationDate`
+  - `/ModDate`
+  - document `/ID`
 

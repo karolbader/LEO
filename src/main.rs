@@ -30,12 +30,17 @@ const CLAIMS_FILE: &str = "epi.claims.v1.json";
 const DRIFT_REPORT_FILE: &str = "epi.drift_report.v1.json";
 const DRIFT_MARKDOWN_FILE: &str = "DRIFT.md";
 const DECISION_PACK_MANIFEST_FILE: &str = "DecisionPack.manifest.json";
+const DECISION_PACK_SEAL_FILE: &str = "DecisionPack.seal.json";
 const DECISION_PACK_HTML_FILE: &str = "DecisionPack.html";
+const DECISION_PACK_PDF_FILE: &str = "DecisionPack.pdf";
+const DECISION_PACK_PDF_SHA256_FILE: &str = "SHA256.txt";
 const QUOTE_JSON_FILE: &str = "Quote.json";
-const DECISION_PACK_ARTIFACT_BASENAMES: [&str; 8] = [
+const DECISION_PACK_ARTIFACT_BASENAMES: [&str; 10] = [
     DECISION_PACK_MANIFEST_FILE,
-    "DecisionPack.seal.json",
+    DECISION_PACK_SEAL_FILE,
     DECISION_PACK_HTML_FILE,
+    DECISION_PACK_PDF_FILE,
+    DECISION_PACK_PDF_SHA256_FILE,
     "REPLAY.md",
     QUOTE_JSON_FILE,
     "Quote.md",
@@ -192,8 +197,19 @@ struct ReplayInstructions {
 struct DecisionPackV1 {
     schema_version: String,
     generated_at: String,
+    pack_meta: DecisionPackMeta,
     toolchain: DecisionPackToolchain,
     artifacts: Vec<DecisionPackArtifact>,
+}
+
+#[derive(Serialize)]
+struct DecisionPackMeta {
+    pack_type: String,
+    library: String,
+    client: String,
+    engagement: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pack_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -335,6 +351,15 @@ struct BundleContext {
     aegis_bin: PathBuf,
     query: String,
     limit: u32,
+}
+
+#[derive(Default)]
+struct DecisionPackMetaDraft {
+    pack_type: Option<String>,
+    library: Option<String>,
+    client: Option<String>,
+    engagement: Option<String>,
+    pack_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -1089,10 +1114,15 @@ fn build_decision_pack(context: &BundleContext) -> Result<DecisionPackV1> {
     sort_paths_deterministically(&mut rel_paths);
 
     let mut artifacts = Vec::new();
+    let mut pack_meta_source_rel: Option<PathBuf> = None;
     for rel in rel_paths {
         let file_name = rel.file_name().and_then(|name| name.to_str()).unwrap_or("");
         if !DECISION_PACK_ARTIFACT_BASENAMES.contains(&file_name) {
             continue;
+        }
+
+        if pack_meta_source_rel.is_none() {
+            pack_meta_source_rel = Some(rel.clone());
         }
 
         let rel_path = normalize_rel_path(&rel);
@@ -1100,9 +1130,12 @@ fn build_decision_pack(context: &BundleContext) -> Result<DecisionPackV1> {
         artifacts.push(DecisionPackArtifact { rel_path, sha256 });
     }
 
+    let pack_meta = build_decision_pack_meta(context, pack_meta_source_rel.as_deref())?;
+
     Ok(DecisionPackV1 {
         schema_version: DECISION_PACK_SCHEMA.to_string(),
         generated_at: now_rfc3339_utc(),
+        pack_meta,
         toolchain: DecisionPackToolchain {
             leo: option_env!("CARGO_PKG_VERSION")
                 .unwrap_or("dev")
@@ -1112,6 +1145,161 @@ fn build_decision_pack(context: &BundleContext) -> Result<DecisionPackV1> {
         },
         artifacts,
     })
+}
+
+fn build_decision_pack_meta(
+    context: &BundleContext,
+    fallback_rel: Option<&Path>,
+) -> Result<DecisionPackMeta> {
+    let mut meta = DecisionPackMetaDraft::default();
+
+    merge_pack_meta_from_json_file(&mut meta, &context.intake);
+
+    let manifest_rel = find_first_file_by_basename(&context.pack_dir, DECISION_PACK_MANIFEST_FILE)?;
+    if let Some(rel_path) = &manifest_rel {
+        merge_pack_meta_from_json_file(&mut meta, &context.pack_dir.join(rel_path));
+    }
+
+    let seal_rel = find_first_file_by_basename(&context.pack_dir, DECISION_PACK_SEAL_FILE)?;
+    if let Some(rel_path) = &seal_rel {
+        merge_pack_meta_from_json_file(&mut meta, &context.pack_dir.join(rel_path));
+    }
+
+    if let Some(source_rel) = manifest_rel
+        .as_deref()
+        .or(seal_rel.as_deref())
+        .or(fallback_rel)
+    {
+        merge_pack_meta_from_rel_path(&mut meta, source_rel);
+    }
+
+    Ok(DecisionPackMeta {
+        pack_type: require_pack_meta_field(&meta.pack_type, "pack_type")?,
+        library: require_pack_meta_field(&meta.library, "library")?,
+        client: require_pack_meta_field(&meta.client, "client")?,
+        engagement: require_pack_meta_field(&meta.engagement, "engagement")?,
+        pack_id: meta.pack_id,
+    })
+}
+
+fn merge_pack_meta_from_json_file(meta: &mut DecisionPackMetaDraft, path: &Path) {
+    if let Ok(bytes) = fs::read(path)
+        && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
+    {
+        merge_pack_meta_from_json(meta, &value);
+    }
+}
+
+fn merge_pack_meta_from_json(meta: &mut DecisionPackMetaDraft, value: &Value) {
+    set_pack_meta_if_missing(
+        &mut meta.pack_type,
+        first_non_empty_json_pointer(
+            value,
+            &["/pack_meta/pack_type", "/pack_type", "/intake/pack_type"],
+        ),
+    );
+    set_pack_meta_if_missing(
+        &mut meta.library,
+        first_non_empty_json_pointer(
+            value,
+            &[
+                "/pack_meta/library",
+                "/library",
+                "/library_pack",
+                "/intake/library",
+                "/intake/library_pack",
+            ],
+        ),
+    );
+    set_pack_meta_if_missing(
+        &mut meta.client,
+        first_non_empty_json_pointer(
+            value,
+            &[
+                "/pack_meta/client",
+                "/client",
+                "/client_id",
+                "/intake/client",
+                "/intake/client_id",
+            ],
+        ),
+    );
+    set_pack_meta_if_missing(
+        &mut meta.engagement,
+        first_non_empty_json_pointer(
+            value,
+            &[
+                "/pack_meta/engagement",
+                "/engagement",
+                "/engagement_id",
+                "/intake/engagement",
+                "/intake/engagement_id",
+            ],
+        ),
+    );
+    set_pack_meta_if_missing(
+        &mut meta.pack_id,
+        first_non_empty_json_pointer(
+            value,
+            &["/pack_meta/pack_id", "/pack_id", "/intake/pack_id"],
+        ),
+    );
+}
+
+fn first_non_empty_json_pointer<'a>(value: &'a Value, pointers: &[&str]) -> Option<&'a str> {
+    for pointer in pointers {
+        if let Some(text) = value.pointer(pointer).and_then(value_non_empty_string) {
+            return Some(text);
+        }
+    }
+    None
+}
+
+fn set_pack_meta_if_missing(slot: &mut Option<String>, candidate: Option<&str>) {
+    if slot.is_none()
+        && let Some(value) = normalize_non_empty_metadata_value(candidate)
+    {
+        *slot = Some(value);
+    }
+}
+
+fn merge_pack_meta_from_rel_path(meta: &mut DecisionPackMetaDraft, rel_path: &Path) {
+    let Some(parent) = rel_path.parent() else {
+        return;
+    };
+
+    let segments = parent
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(segment) => Some(segment.to_string_lossy().to_string()),
+            _ => None,
+        })
+        .collect::<Vec<String>>();
+
+    if segments.len() < 3 {
+        return;
+    }
+
+    let base = segments.len() - 3;
+    set_pack_meta_if_missing(&mut meta.client, Some(segments[base].as_str()));
+    set_pack_meta_if_missing(&mut meta.engagement, Some(segments[base + 1].as_str()));
+    set_pack_meta_if_missing(&mut meta.pack_id, Some(segments[base + 2].as_str()));
+}
+
+fn require_pack_meta_field(value: &Option<String>, field_name: &str) -> Result<String> {
+    normalize_non_empty_metadata_value(value.as_deref()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "missing required decision pack metadata field '{}' (expected run context, manifest, or <client>/<engagement>/PACK-xxx path)",
+            field_name
+        )
+    })
+}
+
+fn normalize_non_empty_metadata_value(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn build_self_drift_report(pack_dir: &Path) -> Result<DriftReportV1> {
@@ -2750,6 +2938,202 @@ mod tests {
                 ch.is_ascii_hexdigit() && (!ch.is_ascii_alphabetic() || ch.is_ascii_uppercase())
             }));
 
+            Ok(())
+        })();
+
+        if temp_root.exists() {
+            let _ = fs::remove_dir_all(&temp_root);
+        }
+        result
+    }
+
+    #[test]
+    fn decision_pack_meta_is_populated_and_non_empty() -> Result<()> {
+        let temp_root = std::env::temp_dir().join(format!("leo-test-pack-meta-{}", Uuid::new_v4()));
+        let result = (|| -> Result<()> {
+            let pack_dir = temp_root.join("pack");
+            let decision_pack_dir = pack_dir.join("acme").join("eng42").join("PACK-001");
+            fs::create_dir_all(&decision_pack_dir)?;
+
+            let manifest = json!({
+                "schema_version": "aegis.manifest.v1.1",
+                "pack_meta": {
+                    "pack_type": "trust_audit",
+                    "library": "vendorsecurity/v1",
+                    "client": "acme",
+                    "engagement": "eng42",
+                    "pack_id": "PACK-001"
+                }
+            });
+            write_json_pretty(
+                &decision_pack_dir.join(DECISION_PACK_MANIFEST_FILE),
+                &manifest,
+            )?;
+            fs::write(
+                decision_pack_dir.join(DECISION_PACK_HTML_FILE),
+                "<html><body>DecisionPack</body></html>",
+            )?;
+
+            let intake = json!({
+                "schema_version": "aegis.intake.v1",
+                "client_id": "acme",
+                "engagement_id": "eng42",
+                "pack_type": "trust_audit",
+                "library_pack": "vendorsecurity/v1"
+            });
+            let intake_path = temp_root.join("intake.json");
+            write_json_pretty(&intake_path, &intake)?;
+
+            let context = BundleContext {
+                out_dir: temp_root.clone(),
+                pack_dir,
+                vault: PathBuf::from("vault"),
+                intake: intake_path,
+                cupola_bin: PathBuf::from("cupola-cli.exe"),
+                cupola_repo: PathBuf::from("."),
+                aegis_bin: PathBuf::from("aegis.exe"),
+                query: "alpha".to_string(),
+                limit: 20,
+            };
+
+            let decision_pack = build_decision_pack(&context)?;
+            assert_eq!(decision_pack.pack_meta.pack_type, "trust_audit");
+            assert_eq!(decision_pack.pack_meta.library, "vendorsecurity/v1");
+            assert_eq!(decision_pack.pack_meta.client, "acme");
+            assert_eq!(decision_pack.pack_meta.engagement, "eng42");
+            assert_eq!(decision_pack.pack_meta.pack_id.as_deref(), Some("PACK-001"));
+            Ok(())
+        })();
+
+        if temp_root.exists() {
+            let _ = fs::remove_dir_all(&temp_root);
+        }
+        result
+    }
+
+    #[test]
+    fn decision_pack_meta_fails_when_required_fields_are_missing() -> Result<()> {
+        let temp_root =
+            std::env::temp_dir().join(format!("leo-test-pack-meta-missing-{}", Uuid::new_v4()));
+        let result = (|| -> Result<()> {
+            let pack_dir = temp_root.join("pack");
+            let decision_pack_dir = pack_dir.join("acme").join("eng42").join("PACK-001");
+            fs::create_dir_all(&decision_pack_dir)?;
+            fs::write(
+                decision_pack_dir.join(DECISION_PACK_HTML_FILE),
+                "<html><body>DecisionPack</body></html>",
+            )?;
+
+            let intake = json!({
+                "schema_version": "aegis.intake.v1",
+                "client_id": "   ",
+                "engagement_id": "   ",
+                "pack_type": "   ",
+                "library_pack": "   ",
+                "pack_meta": {
+                    "pack_type": "   ",
+                    "library": "   ",
+                    "client": "   ",
+                    "engagement": "   "
+                }
+            });
+            let intake_path = temp_root.join("intake-missing.json");
+            write_json_pretty(&intake_path, &intake)?;
+
+            let context = BundleContext {
+                out_dir: temp_root.clone(),
+                pack_dir,
+                vault: PathBuf::from("vault"),
+                intake: intake_path,
+                cupola_bin: PathBuf::from("cupola-cli.exe"),
+                cupola_repo: PathBuf::from("."),
+                aegis_bin: PathBuf::from("aegis.exe"),
+                query: "alpha".to_string(),
+                limit: 20,
+            };
+
+            let err = match build_decision_pack(&context) {
+                Ok(_) => panic!("decision pack generation should fail when metadata is incomplete"),
+                Err(err) => err,
+            };
+            assert!(
+                err.to_string()
+                    .contains("missing required decision pack metadata field"),
+                "unexpected error: {err:#}"
+            );
+            Ok(())
+        })();
+
+        if temp_root.exists() {
+            let _ = fs::remove_dir_all(&temp_root);
+        }
+        result
+    }
+
+    #[test]
+    fn emitted_decision_pack_json_has_non_empty_pack_meta_fields() -> Result<()> {
+        let temp_root =
+            std::env::temp_dir().join(format!("leo-test-pack-meta-json-{}", Uuid::new_v4()));
+        let result = (|| -> Result<()> {
+            let pack_dir = temp_root.join("pack");
+            let decision_pack_dir = pack_dir
+                .join("demo-vendorsecurity-v1")
+                .join("starter")
+                .join("PACK-001");
+            fs::create_dir_all(&decision_pack_dir)?;
+            fs::write(
+                decision_pack_dir.join(DECISION_PACK_HTML_FILE),
+                "<html><body>DecisionPack</body></html>",
+            )?;
+
+            let intake = json!({
+                "schema_version": "aegis.intake.v1",
+                "client_id": "demo-vendorsecurity-v1",
+                "engagement_id": "starter",
+                "pack_type": "trust_audit",
+                "library_pack": "vendorsecurity/v1",
+                "pack_meta": {
+                    "pack_type": "demo",
+                    "library": "vendorsecurity-v1",
+                    "client": "demo-vendorsecurity-v1",
+                    "engagement": "starter",
+                    "pack_id": "PACK-001"
+                }
+            });
+            let intake_path = temp_root.join("intake.json");
+            write_json_pretty(&intake_path, &intake)?;
+
+            let context = BundleContext {
+                out_dir: temp_root.clone(),
+                pack_dir: pack_dir.clone(),
+                vault: PathBuf::from("vault"),
+                intake: intake_path,
+                cupola_bin: PathBuf::from("cupola-cli.exe"),
+                cupola_repo: PathBuf::from("."),
+                aegis_bin: PathBuf::from("aegis.exe"),
+                query: "alpha".to_string(),
+                limit: 20,
+            };
+
+            let decision_pack = build_decision_pack(&context)?;
+            let decision_pack_path = pack_dir.join(DECISION_PACK_FILE);
+            write_json_pretty(&decision_pack_path, &decision_pack)?;
+            let value: Value = serde_json::from_slice(&fs::read(&decision_pack_path)?)?;
+
+            for field in ["pack_type", "library", "client", "engagement"] {
+                let pointer = format!("/pack_meta/{field}");
+                let text = value
+                    .pointer(&pointer)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                assert!(
+                    !text.is_empty(),
+                    "expected /pack_meta/{field} to be non-empty in {}",
+                    decision_pack_path.display()
+                );
+            }
             Ok(())
         })();
 
