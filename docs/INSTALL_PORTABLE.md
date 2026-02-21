@@ -76,4 +76,6 @@ Each output includes:
   - `/CreationDate`
   - `/ModDate`
   - document `/ID`
+- `SHA256.txt` records a hash of `DecisionPack.pdf`, but the PDF itself is not the integrity anchor.
+- Cryptographic source of truth is `pack.zip` + `epi.seal` + `verify.json` from `epi verify`.
 

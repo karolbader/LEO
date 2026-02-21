@@ -48,6 +48,9 @@ const DECISION_PACK_ARTIFACT_BASENAMES: [&str; 10] = [
     "cupola.manifest.json",
 ];
 const PACK_FILE: &str = "pack.zip";
+const VERIFY_FILE: &str = "verify.json";
+const MIN_DECISION_PACK_PDF_BYTES: u64 = 50_000;
+const PDF_RENDER_SCRIPT_REL: &str = "scripts/render_decision_pack_pdf.mjs";
 
 #[derive(Parser, Debug)]
 #[command(name = "leo", version, about = "Local EPI orchestration harness")]
@@ -151,6 +154,7 @@ struct RunInputs {
 struct ToolVersions {
     cupola_cli: String,
     aegis: String,
+    epi_cli: String,
 }
 
 #[derive(Serialize)]
@@ -203,6 +207,12 @@ struct DecisionPackV1 {
 }
 
 #[derive(Serialize)]
+struct DecisionPackHeaderV1 {
+    schema_version: String,
+    pack_meta: DecisionPackMeta,
+}
+
+#[derive(Serialize)]
 struct DecisionPackMeta {
     pack_type: String,
     library: String,
@@ -210,6 +220,35 @@ struct DecisionPackMeta {
     engagement: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pack_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct VerifyReport {
+    ok: bool,
+    pack_zip: String,
+    pack_type: String,
+    library: String,
+    client: String,
+    engagement: String,
+    pack_meta: VerifyPackMeta,
+    missing_files: Vec<String>,
+    schema_errors: Vec<String>,
+    mismatches: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verifier_ok: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verifier_status_success: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verifier_error: Option<String>,
+    verifier_json: Value,
+}
+
+#[derive(Debug, Serialize)]
+struct VerifyPackMeta {
+    pack_type: String,
+    library: String,
+    client: String,
+    engagement: String,
 }
 
 #[derive(Serialize)]
@@ -349,6 +388,7 @@ struct BundleContext {
     cupola_bin: PathBuf,
     cupola_repo: PathBuf,
     aegis_bin: PathBuf,
+    aegis_data_dir: PathBuf,
     query: String,
     limit: u32,
 }
@@ -374,10 +414,17 @@ struct LeoConfig {
 struct ToolResolution {
     tool_name: &'static str,
     env_var: &'static str,
-    embedded_path: PathBuf,
     selected_path: PathBuf,
     selected_source: &'static str,
     selected_exists: bool,
+    candidates: Vec<ToolCandidate>,
+}
+
+#[derive(Clone)]
+struct ToolCandidate {
+    source: &'static str,
+    path: PathBuf,
+    exists: bool,
 }
 
 struct ResolvedTools {
@@ -410,8 +457,10 @@ fn run(args: RunArgs) -> Result<()> {
     let tools = resolve_tools(&args.tools)?;
     let cupola_bin = require_tool_binary(&tools.cupola)?;
     let aegis_bin = require_tool_binary(&tools.aegis)?;
+    let epi_bin = require_tool_binary(&tools.epi)?;
     let out_dir = absolutize(&args.out)?;
     let cupola_repo_for_aegis = resolve_cupola_repo_for_aegis(&cupola_bin);
+    let aegis_data_dir = resolve_aegis_data_dir(&aegis_bin)?;
     ensure_outside_vault(&args.vault, &out_dir)?;
 
     fs::create_dir_all(&out_dir)
@@ -427,6 +476,7 @@ fn run(args: RunArgs) -> Result<()> {
     let tool_versions = ToolVersions {
         cupola_cli: detect_tool_version(&cupola_bin),
         aegis: detect_tool_version(&aegis_bin),
+        epi_cli: detect_tool_version(&epi_bin),
     };
 
     let cupola_argv = vec![
@@ -453,9 +503,12 @@ fn run(args: RunArgs) -> Result<()> {
         path_to_string(&args.intake),
         "--out".to_string(),
         path_to_string(&pack_dir),
+        "--data-dir".to_string(),
+        path_to_string(&aegis_data_dir),
     ];
     let cupola_cwd = command_working_dir_for_binary(&cupola_bin)?;
-    let aegis_cwd = command_working_dir_for_binary(&aegis_bin)?;
+    let aegis_cwd = out_dir.clone();
+    let epi_cwd = command_working_dir_for_binary(&epi_bin)?;
 
     let mut steps = Vec::new();
     let cupola_step = execute_step(
@@ -483,8 +536,26 @@ fn run(args: RunArgs) -> Result<()> {
         &logs_dir,
         &pack_dir,
     )?;
-    any_failed |= aegis_step.status != "ok";
+    let aegis_ok = aegis_step.status == "ok";
+    any_failed |= !aegis_ok;
     steps.push(aegis_step);
+
+    let render_step = execute_render_pdf_step(
+        &tools.leo_root,
+        &args.intake,
+        aegis_ok,
+        StepSpec {
+            step_id: "step-03-render-pdf",
+            tool: "node",
+            cwd: tools.leo_root.clone(),
+            argv: vec!["node".to_string(), PDF_RENDER_SCRIPT_REL.to_string()],
+        },
+        &out_dir,
+        &logs_dir,
+        &pack_dir,
+    )?;
+    any_failed |= render_step.status != "ok";
+    steps.push(render_step);
 
     let runlog = RunLogV1 {
         schema_version: RUNLOG_SCHEMA.to_string(),
@@ -516,10 +587,37 @@ fn run(args: RunArgs) -> Result<()> {
         cupola_bin,
         cupola_repo: cupola_repo_for_aegis,
         aegis_bin,
+        aegis_data_dir: aegis_data_dir.clone(),
         query: args.query.clone(),
         limit: args.limit,
     };
-    package_bundle(&bundle_context)?;
+    let mut package_error: Option<String> = None;
+    if any_failed {
+        package_error = Some(bundle_skip_reason_for_failed_steps(&pack_dir));
+    } else if let Err(err) = package_bundle(&bundle_context) {
+        package_error = Some(format!("{err:#}"));
+    }
+
+    let pack_zip = out_dir.join(PACK_FILE);
+    let verify_step = execute_verify_pack_step(
+        StepSpec {
+            step_id: "step-04-verify",
+            tool: "epi-cli",
+            cwd: epi_cwd,
+            argv: vec![
+                path_to_string(&epi_bin),
+                "verify".to_string(),
+                path_to_string(&pack_zip),
+                "--json".to_string(),
+            ],
+        },
+        &out_dir,
+        &logs_dir,
+        &pack_dir,
+        &pack_zip,
+        package_error.as_deref(),
+    )?;
+    any_failed |= package_error.is_some() || verify_step.status != "ok";
 
     if any_failed {
         bail!("one or more tool steps failed; stop_reason=tool_failed");
@@ -532,6 +630,7 @@ fn pack_only(args: PackArgs) -> Result<()> {
     let tools = resolve_tools(&args.tools)?;
     let cupola_bin = require_tool_binary(&tools.cupola)?;
     let aegis_bin = require_tool_binary(&tools.aegis)?;
+    let aegis_data_dir = resolve_aegis_data_dir(&aegis_bin)?;
     let out_dir = absolutize(&args.out)?;
     let cupola_repo_for_aegis = resolve_cupola_repo_for_aegis(&cupola_bin);
     ensure_outside_vault(&args.vault, &out_dir)?;
@@ -548,6 +647,7 @@ fn pack_only(args: PackArgs) -> Result<()> {
         cupola_bin,
         cupola_repo: cupola_repo_for_aegis,
         aegis_bin,
+        aegis_data_dir,
         query: args.query,
         limit: args.limit,
     };
@@ -616,6 +716,25 @@ fn doctor(args: DoctorArgs) -> Result<()> {
     failed |= print_tool_check(&tools.cupola);
     failed |= print_tool_check(&tools.aegis);
     failed |= print_tool_check(&tools.epi);
+    if tools.aegis.selected_exists {
+        match resolve_aegis_data_dir(&tools.aegis.selected_path) {
+            Ok(aegis_data_dir) => {
+                let packs_dir = aegis_data_dir.join("packs");
+                println!(
+                    "aegis_data_dir: {} [packs={} path={}]",
+                    aegis_data_dir.display(),
+                    if packs_dir.is_dir() { "ok" } else { "missing" },
+                    packs_dir.display()
+                );
+            }
+            Err(err) => {
+                println!("aegis_data_dir: [error] {err:#}");
+                failed = true;
+            }
+        }
+    } else {
+        println!("aegis_data_dir: unresolved [skipped: aegis binary missing]");
+    }
 
     if failed {
         bail!("doctor checks failed");
@@ -682,88 +801,65 @@ fn resolve_tool_path(
     config_path: Option<&PathBuf>,
     leo_root: &Path,
 ) -> ToolResolution {
-    let env_path = read_env_path(env_var);
+    let cli_path = cli_override.map(|path| resolve_relative_to_cwd(path));
+    let config_candidate = config_path.map(|path| resolve_relative_to_root(leo_root, path));
+    let env_candidate = read_env_path(env_var).map(|path| resolve_relative_to_cwd(&path));
 
-    if let Some(path) = cli_override {
-        let selected_path = resolve_relative_to_cwd(path);
-        return ToolResolution {
-            tool_name,
-            env_var,
-            embedded_path,
-            selected_path: selected_path.clone(),
-            selected_source: "cli",
-            selected_exists: selected_path.is_file(),
-        };
+    let mut candidates = Vec::new();
+    if let Some(path) = &cli_path {
+        candidates.push(ToolCandidate {
+            source: "cli",
+            path: path.clone(),
+            exists: path.is_file(),
+        });
+    }
+    candidates.push(ToolCandidate {
+        source: "tools",
+        path: embedded_path.clone(),
+        exists: embedded_path.is_file(),
+    });
+    if let Some(path) = &config_candidate {
+        candidates.push(ToolCandidate {
+            source: "config",
+            path: path.clone(),
+            exists: path.is_file(),
+        });
+    }
+    if let Some(path) = &env_candidate {
+        candidates.push(ToolCandidate {
+            source: "env",
+            path: path.clone(),
+            exists: path.is_file(),
+        });
     }
 
-    if embedded_path.is_file() {
-        return ToolResolution {
-            tool_name,
-            env_var,
-            embedded_path: embedded_path.clone(),
-            selected_path: embedded_path,
-            selected_source: "tools",
-            selected_exists: true,
-        };
-    }
-
-    if let Some(path) = config_path {
-        let selected_path = resolve_relative_to_root(leo_root, path);
-        if selected_path.is_file() {
-            return ToolResolution {
-                tool_name,
-                env_var,
-                embedded_path,
-                selected_path,
-                selected_source: "config",
-                selected_exists: true,
-            };
-        }
-    }
-
-    if let Some(path) = &env_path
+    let (selected_source, selected_path) = if let Some(path) = cli_path {
+        ("cli", path)
+    } else if embedded_path.is_file() {
+        ("tools", embedded_path.clone())
+    } else if let Some(path) = &config_candidate
         && path.is_file()
     {
-        return ToolResolution {
-            tool_name,
-            env_var,
-            embedded_path,
-            selected_path: path.clone(),
-            selected_source: "env",
-            selected_exists: true,
-        };
-    }
-
-    if let Some(path) = config_path {
-        let selected_path = resolve_relative_to_root(leo_root, path);
-        return ToolResolution {
-            tool_name,
-            env_var,
-            embedded_path,
-            selected_path: selected_path.clone(),
-            selected_source: "config",
-            selected_exists: selected_path.is_file(),
-        };
-    }
-
-    if let Some(path) = env_path {
-        return ToolResolution {
-            tool_name,
-            env_var,
-            embedded_path,
-            selected_path: path.clone(),
-            selected_source: "env",
-            selected_exists: path.is_file(),
-        };
-    }
+        ("config", path.clone())
+    } else if let Some(path) = &env_candidate
+        && path.is_file()
+    {
+        ("env", path.clone())
+    } else if let Some(path) = config_candidate {
+        ("config", path)
+    } else if let Some(path) = env_candidate {
+        ("env", path)
+    } else {
+        ("tools", embedded_path.clone())
+    };
 
     ToolResolution {
         tool_name,
         env_var,
-        embedded_path: embedded_path.clone(),
-        selected_path: embedded_path.clone(),
-        selected_source: "tools",
-        selected_exists: embedded_path.is_file(),
+        selected_exists: selected_path.is_file(),
+        selected_path,
+        selected_source,
+        candidates,
     }
 }
 
@@ -806,13 +902,27 @@ fn require_tool_binary(tool: &ToolResolution) -> Result<PathBuf> {
         return Ok(tool.selected_path.clone());
     }
 
+    let attempted = tool
+        .candidates
+        .iter()
+        .map(|candidate| {
+            format!(
+                "  - {}: {} [{}]",
+                candidate.source,
+                candidate.path.display(),
+                if candidate.exists { "ok" } else { "missing" }
+            )
+        })
+        .collect::<Vec<String>>()
+        .join("\n");
+
     bail!(
-        "missing {} at {} (source={}, embedded={}, env={})",
+        "missing tool '{}'\nselected: {} (source={})\nattempted paths:\n{}\nfix: {}",
         tool.tool_name,
         tool.selected_path.display(),
         tool.selected_source,
-        tool.embedded_path.display(),
-        tool.env_var
+        attempted,
+        tool_fix_hint(tool)
     );
 }
 
@@ -841,7 +951,6 @@ fn verify_writable_dir(path: &Path) -> Result<()> {
 }
 
 fn print_tool_check(tool: &ToolResolution) -> bool {
-    let embedded_ok = tool.embedded_path.is_file();
     let selected_ok = tool.selected_exists;
 
     println!(
@@ -850,16 +959,14 @@ fn print_tool_check(tool: &ToolResolution) -> bool {
         tool.selected_path.display(),
         tool.selected_source
     );
-    println!(
-        "  embedded={} [{}]",
-        tool.embedded_path.display(),
-        if embedded_ok { "ok" } else { "missing" }
-    );
-    println!(
-        "  selected={} [{}]",
-        tool.selected_path.display(),
-        if selected_ok { "ok" } else { "missing" }
-    );
+    for candidate in &tool.candidates {
+        println!(
+            "  candidate[{source}]={path} [{status}]",
+            source = candidate.source,
+            path = candidate.path.display(),
+            status = if candidate.exists { "ok" } else { "missing" }
+        );
+    }
     println!("  env_var={}", tool.env_var);
 
     if selected_ok {
@@ -871,9 +978,23 @@ fn print_tool_check(tool: &ToolResolution) -> bool {
         }
     } else {
         println!("  version=unknown");
+        println!("  fix={}", tool_fix_hint(tool));
     }
 
-    !(embedded_ok && selected_ok)
+    !selected_ok
+}
+
+fn tool_fix_hint(tool: &ToolResolution) -> String {
+    let cli_flag = match tool.tool_name {
+        "cupola-cli.exe" => "--cupola-bin",
+        "aegis.exe" => "--aegis-bin",
+        "epi-cli.exe" => "--epi-bin",
+        _ => "--tool-bin",
+    };
+    format!(
+        "pass {cli_flag} <PATH> or set {} to a valid executable path",
+        tool.env_var
+    )
 }
 
 fn command_working_dir_for_binary(binary_path: &Path) -> Result<PathBuf> {
@@ -908,36 +1029,426 @@ fn resolve_cupola_repo_for_aegis(cupola_bin: &Path) -> PathBuf {
     binary_dir.to_path_buf()
 }
 
+fn resolve_aegis_data_dir(aegis_bin: &Path) -> Result<PathBuf> {
+    let mut attempts = Vec::new();
+
+    if let Some(env_path) = read_env_path("AEGIS_DATA_DIR") {
+        let candidate = resolve_relative_to_cwd(&env_path);
+        attempts.push(format_aegis_data_dir_attempt(
+            "env AEGIS_DATA_DIR",
+            &candidate,
+        ));
+        if candidate.is_dir() {
+            return validate_aegis_data_dir(&candidate, "env AEGIS_DATA_DIR", &attempts);
+        }
+    }
+
+    if let Some(repo_data_dir) = infer_repo_data_dir_from_aegis_bin(aegis_bin) {
+        attempts.push(format_aegis_data_dir_attempt(
+            "repo inference <repo>\\target\\{release|debug}\\aegis.exe -> <repo>\\data",
+            &repo_data_dir,
+        ));
+        return validate_aegis_data_dir(
+            &repo_data_dir,
+            "aegis binary at <repo>\\target\\{release|debug}\\aegis.exe",
+            &attempts,
+        );
+    }
+
+    if let Some(bin_dir) = aegis_bin.parent() {
+        let candidate = normalize_lexical(&bin_dir.join("data"));
+        attempts.push(format_aegis_data_dir_attempt(
+            "packaged inference <exe_dir>\\data",
+            &candidate,
+        ));
+        if candidate.is_dir() {
+            return validate_aegis_data_dir(
+                &candidate,
+                "aegis binary packaged alongside <exe_dir>\\data",
+                &attempts,
+            );
+        }
+    } else {
+        attempts.push(format!(
+            "packaged inference <exe_dir>\\data => skipped [missing executable parent for {}]",
+            aegis_bin.display()
+        ));
+    }
+
+    bail!(
+        "unable to resolve AEGIS data directory for {}\nattempted:\n  - {}\nfix: set AEGIS_DATA_DIR to a valid <DATA_DIR> containing a 'packs' directory",
+        aegis_bin.display(),
+        attempts.join("\n  - ")
+    );
+}
+
+fn infer_repo_data_dir_from_aegis_bin(aegis_bin: &Path) -> Option<PathBuf> {
+    let binary_name = aegis_bin.file_name()?.to_str()?;
+    if !binary_name.eq_ignore_ascii_case("aegis.exe") && !binary_name.eq_ignore_ascii_case("aegis")
+    {
+        return None;
+    }
+
+    let exe_dir = aegis_bin.parent()?;
+    let profile = exe_dir.file_name()?.to_str()?;
+    if !profile.eq_ignore_ascii_case("release") && !profile.eq_ignore_ascii_case("debug") {
+        return None;
+    }
+
+    let target_dir = exe_dir.parent()?;
+    if !target_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("target"))
+    {
+        return None;
+    }
+
+    let repo_root = target_dir.parent()?;
+    Some(normalize_lexical(&repo_root.join("data")))
+}
+
+fn format_aegis_data_dir_attempt(label: &str, candidate: &Path) -> String {
+    let normalized = normalize_lexical(candidate);
+    let packs = normalized.join("packs");
+    format!(
+        "{label}: {} [data_dir={}, packs={} ({})]",
+        normalized.display(),
+        if normalized.is_dir() { "ok" } else { "missing" },
+        if packs.is_dir() { "ok" } else { "missing" },
+        packs.display()
+    )
+}
+
+fn validate_aegis_data_dir(candidate: &Path, source: &str, attempts: &[String]) -> Result<PathBuf> {
+    let normalized = normalize_lexical(candidate);
+    let packs_dir = normalized.join("packs");
+    if !normalized.is_dir() || !packs_dir.is_dir() {
+        bail!(
+            "invalid AEGIS data directory from {source}: {}\nexpected an existing data directory with a 'packs' subdirectory ({})\nattempted:\n  - {}\nfix: set AEGIS_DATA_DIR to a valid <DATA_DIR> containing a 'packs' directory",
+            normalized.display(),
+            packs_dir.display(),
+            attempts.join("\n  - ")
+        );
+    }
+    Ok(normalized)
+}
+
+fn resolve_pdf_render_script(leo_root: &Path) -> Result<PathBuf> {
+    let mut candidates = vec![normalize_lexical(&leo_root.join(PDF_RENDER_SCRIPT_REL))];
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(normalize_lexical(&cwd.join(PDF_RENDER_SCRIPT_REL)));
+    }
+    candidates.push(normalize_lexical(
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(PDF_RENDER_SCRIPT_REL),
+    ));
+
+    for candidate in &candidates {
+        if candidate.is_file() {
+            return Ok(candidate.clone());
+        }
+    }
+
+    let attempted = candidates
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<String>>()
+        .join(", ");
+    bail!(
+        "missing pdf renderer script '{}' (attempted: {})",
+        PDF_RENDER_SCRIPT_REL,
+        attempted
+    );
+}
+
 fn execute_step(
     spec: StepSpec,
     out_dir: &Path,
     logs_dir: &Path,
     pack_dir: &Path,
 ) -> Result<RunStep> {
+    execute_internal_step(spec, out_dir, logs_dir, pack_dir, |spec, stdout, stderr| {
+        let output = run_command_capture(&spec.cwd, &spec.argv)?;
+        stdout.extend_from_slice(&output.stdout);
+        stderr.extend_from_slice(&output.stderr);
+        if output.status.success() {
+            Ok(())
+        } else {
+            bail!(
+                "command exited with status {}",
+                output
+                    .status
+                    .code()
+                    .map_or_else(|| "unknown".to_string(), |code| code.to_string())
+            );
+        }
+    })
+}
+
+fn execute_render_pdf_step(
+    leo_root: &Path,
+    intake_path: &Path,
+    write_prerender_stub: bool,
+    spec: StepSpec,
+    out_dir: &Path,
+    logs_dir: &Path,
+    pack_dir: &Path,
+) -> Result<RunStep> {
+    execute_internal_step(spec, out_dir, logs_dir, pack_dir, |_, stdout, stderr| {
+        if write_prerender_stub {
+            write_prerender_decision_pack_stub(pack_dir, intake_path)?;
+        }
+        let script_path = resolve_pdf_render_script(leo_root)?;
+        let html_rel = resolve_required_decision_pack_html_rel(pack_dir)?;
+        let html_path = pack_dir.join(&html_rel);
+        let pdf_dir = html_path.parent().ok_or_else(|| {
+            anyhow::anyhow!(
+                "failed to resolve parent directory for {}",
+                html_path.display()
+            )
+        })?;
+        let pdf_path = pdf_dir.join(DECISION_PACK_PDF_FILE);
+        let sha_path = pdf_dir.join(DECISION_PACK_PDF_SHA256_FILE);
+
+        let argv = vec![
+            "node".to_string(),
+            path_to_string(&script_path),
+            "--html".to_string(),
+            path_to_string(&html_path),
+            "--pdf".to_string(),
+            path_to_string(&pdf_path),
+        ];
+
+        let output = run_command_capture(leo_root, &argv)?;
+        stdout.extend_from_slice(&output.stdout);
+        stderr.extend_from_slice(&output.stderr);
+        if !output.status.success() {
+            bail!(
+                "pdf render command failed with status {}",
+                output
+                    .status
+                    .code()
+                    .map_or_else(|| "unknown".to_string(), |code| code.to_string())
+            );
+        }
+
+        if !pdf_path.is_file() {
+            bail!(
+                "{} is missing next to {} after render: {}",
+                DECISION_PACK_PDF_FILE,
+                DECISION_PACK_HTML_FILE,
+                pdf_path.display()
+            );
+        }
+
+        let pdf_size = fs::metadata(&pdf_path)
+            .with_context(|| format!("failed to stat rendered pdf: {}", pdf_path.display()))?
+            .len();
+        if pdf_size < MIN_DECISION_PACK_PDF_BYTES {
+            bail!(
+                "{} is too small ({} bytes, expected >= {} bytes): {}",
+                DECISION_PACK_PDF_FILE,
+                pdf_size,
+                MIN_DECISION_PACK_PDF_BYTES,
+                pdf_path.display()
+            );
+        }
+
+        let pdf_sha = sha256_file(&pdf_path)?;
+        fs::write(&sha_path, format!("{pdf_sha}  {}\n", pdf_path.display()))
+            .with_context(|| format!("failed to write {}", sha_path.display()))?;
+        if !sha_path.is_file() {
+            bail!(
+                "{} is missing next to {}: {}",
+                DECISION_PACK_PDF_SHA256_FILE,
+                DECISION_PACK_PDF_FILE,
+                sha_path.display()
+            );
+        }
+        Ok(())
+    })
+}
+
+fn resolve_required_decision_pack_html_rel(pack_dir: &Path) -> Result<PathBuf> {
+    find_first_file_by_basename(pack_dir, DECISION_PACK_HTML_FILE)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} is missing in {}",
+            DECISION_PACK_HTML_FILE,
+            pack_dir.display()
+        )
+    })
+}
+
+fn write_prerender_decision_pack_stub(pack_dir: &Path, intake_path: &Path) -> Result<()> {
+    let _ = resolve_required_decision_pack_html_rel(pack_dir)?;
+    let intake_bytes = fs::read(intake_path)
+        .with_context(|| format!("failed to read intake: {}", intake_path.display()))?;
+    let intake_json: Value = serde_json::from_slice(&intake_bytes)
+        .with_context(|| format!("failed to parse intake JSON: {}", intake_path.display()))?;
+
+    let stub = DecisionPackHeaderV1 {
+        schema_version: DECISION_PACK_SCHEMA.to_string(),
+        pack_meta: DecisionPackMeta {
+            pack_type: required_intake_metadata_field(
+                &intake_json,
+                intake_path,
+                "pack_type",
+                &["/pack_type", "/intake/pack_type"],
+            )?,
+            library: required_intake_metadata_field(
+                &intake_json,
+                intake_path,
+                "library_pack",
+                &["/library_pack", "/intake/library_pack"],
+            )?,
+            client: required_intake_metadata_field(
+                &intake_json,
+                intake_path,
+                "client_id",
+                &["/client_id", "/intake/client_id"],
+            )?,
+            engagement: required_intake_metadata_field(
+                &intake_json,
+                intake_path,
+                "engagement_id",
+                &["/engagement_id", "/intake/engagement_id"],
+            )?,
+            pack_id: None,
+        },
+    };
+    write_json_pretty(&pack_dir.join(DECISION_PACK_FILE), &stub)
+}
+
+fn required_intake_metadata_field(
+    intake_json: &Value,
+    intake_path: &Path,
+    field_name: &str,
+    pointers: &[&str],
+) -> Result<String> {
+    first_non_empty_json_pointer(intake_json, pointers)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "missing required intake metadata field '{}' in {}",
+                field_name,
+                intake_path.display()
+            )
+        })
+}
+
+fn execute_verify_pack_step(
+    spec: StepSpec,
+    out_dir: &Path,
+    logs_dir: &Path,
+    pack_dir: &Path,
+    pack_zip: &Path,
+    package_error: Option<&str>,
+) -> Result<RunStep> {
+    execute_internal_step(spec, out_dir, logs_dir, pack_dir, |spec, stdout, stderr| {
+        let verify_path = out_dir.join(VERIFY_FILE);
+        if let Some(err) = package_error {
+            let message = format!("pack bundling failed before verify: {err}");
+            stderr.extend_from_slice(message.as_bytes());
+            stderr.push(b'\n');
+            let report =
+                build_verify_report(pack_zip, pack_dir, &Value::Null, false, Some(message));
+            write_json_pretty(&verify_path, &report)?;
+            bail!("pack bundling failed before verifier execution");
+        }
+
+        if !pack_zip.is_file() {
+            let message = format!("missing pack zip: {}", pack_zip.display());
+            stderr.extend_from_slice(message.as_bytes());
+            stderr.push(b'\n');
+            let report =
+                build_verify_report(pack_zip, pack_dir, &Value::Null, false, Some(message));
+            write_json_pretty(&verify_path, &report)?;
+            bail!("pack zip is missing");
+        }
+
+        let output = run_command_capture(&spec.cwd, &spec.argv)?;
+        stdout.extend_from_slice(&output.stdout);
+        stderr.extend_from_slice(&output.stderr);
+
+        let mut verifier_error = if output.status.success() {
+            None
+        } else {
+            Some(format!(
+                "epi verifier exited with status {}",
+                output
+                    .status
+                    .code()
+                    .map_or_else(|| "unknown".to_string(), |code| code.to_string())
+            ))
+        };
+
+        let verifier_json = if output.stdout.is_empty() {
+            verifier_error = merge_error(
+                verifier_error,
+                "epi verifier returned empty JSON output".to_string(),
+            );
+            Value::Null
+        } else {
+            match serde_json::from_slice::<Value>(&output.stdout) {
+                Ok(value) => value,
+                Err(err) => {
+                    verifier_error = merge_error(
+                        verifier_error,
+                        format!("epi verifier emitted invalid JSON: {err}"),
+                    );
+                    Value::Null
+                }
+            }
+        };
+
+        let report = build_verify_report(
+            pack_zip,
+            pack_dir,
+            &verifier_json,
+            output.status.success(),
+            verifier_error,
+        );
+        write_json_pretty(&verify_path, &report)?;
+        if report.ok {
+            Ok(())
+        } else {
+            bail!(
+                "verification failed (ok=false). details written to {}",
+                verify_path.display()
+            );
+        }
+    })
+}
+
+fn execute_internal_step<F>(
+    spec: StepSpec,
+    out_dir: &Path,
+    logs_dir: &Path,
+    pack_dir: &Path,
+    runner: F,
+) -> Result<RunStep>
+where
+    F: FnOnce(&StepSpec, &mut Vec<u8>, &mut Vec<u8>) -> Result<()>,
+{
     let before = snapshot_hashes(pack_dir)?;
     let started_at = now_rfc3339_utc();
 
     let stdout_path = logs_dir.join(format!("{}.stdout.log", spec.step_id));
     let stderr_path = logs_dir.join(format!("{}.stderr.log", spec.step_id));
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
 
-    let command_result = run_command_capture(&spec.cwd, &spec.argv);
-    let finished_at = now_rfc3339_utc();
-
-    let (status, stdout_bytes, stderr_bytes) = match command_result {
-        Ok(output) => {
-            let status_text = if output.status.success() {
-                "ok"
-            } else {
-                "error"
-            };
-            (status_text.to_string(), output.stdout, output.stderr)
+    let status = match runner(&spec, &mut stdout_bytes, &mut stderr_bytes) {
+        Ok(()) => "ok".to_string(),
+        Err(err) => {
+            if !stderr_bytes.is_empty() && !stderr_bytes.ends_with(b"\n") {
+                stderr_bytes.push(b'\n');
+            }
+            stderr_bytes.extend_from_slice(format!("{err:#}\n").as_bytes());
+            "error".to_string()
         }
-        Err(err) => (
-            "error".to_string(),
-            Vec::new(),
-            format!("{err:#}\n").into_bytes(),
-        ),
     };
+    let finished_at = now_rfc3339_utc();
 
     fs::write(&stdout_path, &stdout_bytes)
         .with_context(|| format!("failed to write stdout log: {}", stdout_path.display()))?;
@@ -961,6 +1472,7 @@ fn execute_step(
 }
 
 fn package_bundle(context: &BundleContext) -> Result<()> {
+    ensure_final_decision_pack_assets(&context.pack_dir)?;
     write_supporting_epi_files(context)?;
 
     let replay = ReplayInstructions {
@@ -989,7 +1501,64 @@ fn package_bundle(context: &BundleContext) -> Result<()> {
     write_json_pretty(&context.pack_dir.join(SEAL_FILE), &seal)?;
 
     let pack_zip = context.out_dir.join(PACK_FILE);
-    build_zip(&context.pack_dir, &pack_zip, false)?;
+    bundle_pack_directory(&context.pack_dir, &pack_zip)?;
+    Ok(())
+}
+
+fn bundle_skip_reason_for_failed_steps(pack_dir: &Path) -> String {
+    match ensure_final_decision_pack_assets(pack_dir) {
+        Ok(_) => "skipped pack bundling because a prior step failed".to_string(),
+        Err(err) => format!("skipped pack bundling because a prior step failed: {err:#}"),
+    }
+}
+
+fn ensure_final_decision_pack_assets(pack_dir: &Path) -> Result<PathBuf> {
+    let html_rel = resolve_required_decision_pack_html_rel(pack_dir)?;
+    let decision_pack_rel_dir = html_rel.parent().ok_or_else(|| {
+        anyhow::anyhow!(
+            "failed to resolve parent directory for {}",
+            pack_dir.join(&html_rel).display()
+        )
+    })?;
+
+    let pdf_rel = decision_pack_rel_dir.join(DECISION_PACK_PDF_FILE);
+    if !pack_dir.join(&pdf_rel).is_file() {
+        bail!(
+            "{} is missing next to {}: {}",
+            DECISION_PACK_PDF_FILE,
+            DECISION_PACK_HTML_FILE,
+            pack_dir.join(&pdf_rel).display()
+        );
+    }
+
+    let sha_rel = decision_pack_rel_dir.join(DECISION_PACK_PDF_SHA256_FILE);
+    if !pack_dir.join(&sha_rel).is_file() {
+        bail!(
+            "{} is missing next to {}: {}",
+            DECISION_PACK_PDF_SHA256_FILE,
+            DECISION_PACK_PDF_FILE,
+            pack_dir.join(&sha_rel).display()
+        );
+    }
+
+    Ok(decision_pack_rel_dir.to_path_buf())
+}
+
+fn bundle_pack_directory(pack_dir: &Path, zip_path: &Path) -> Result<()> {
+    ensure_final_decision_pack_assets(pack_dir)?;
+    let staged_zip = zip_path.with_extension("tmp.zip");
+    build_zip(pack_dir, &staged_zip, false)?;
+    if zip_path.exists() {
+        fs::remove_file(zip_path)
+            .with_context(|| format!("failed to overwrite zip: {}", zip_path.display()))?;
+    }
+    fs::rename(&staged_zip, zip_path).with_context(|| {
+        format!(
+            "failed to move staged zip {} to {}",
+            staged_zip.display(),
+            zip_path.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -1154,6 +1723,7 @@ fn build_decision_pack_meta(
     let mut meta = DecisionPackMetaDraft::default();
 
     merge_pack_meta_from_json_file(&mut meta, &context.intake);
+    merge_pack_meta_from_json_file(&mut meta, &context.pack_dir.join(DECISION_PACK_FILE));
 
     let manifest_rel = find_first_file_by_basename(&context.pack_dir, DECISION_PACK_MANIFEST_FILE)?;
     if let Some(rel_path) = &manifest_rel {
@@ -1300,6 +1870,237 @@ fn normalize_non_empty_metadata_value(value: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|text| !text.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn build_verify_report(
+    pack_zip: &Path,
+    pack_dir: &Path,
+    verifier_json: &Value,
+    verifier_command_success: bool,
+    verifier_error: Option<String>,
+) -> VerifyReport {
+    let missing_files =
+        extract_verify_string_list(verifier_json, &["/missing_files", "/details/missing_files"]);
+    let schema_errors = extract_verify_string_list(
+        verifier_json,
+        &[
+            "/schema_errors",
+            "/invalid_json",
+            "/details/schema_errors",
+            "/details/invalid_json",
+        ],
+    );
+    let mismatches = extract_verify_string_list(
+        verifier_json,
+        &[
+            "/mismatches",
+            "/schema_version_mismatches",
+            "/details/mismatches",
+            "/details/schema_version_mismatches",
+        ],
+    );
+    let verifier_ok = verifier_json.pointer("/ok").and_then(Value::as_bool);
+    let verifier_status_success = verifier_json
+        .pointer("/status/success")
+        .and_then(Value::as_bool);
+
+    let mut merged_error = verifier_error;
+    let pack_meta = match read_verify_pack_meta(pack_dir) {
+        Ok(meta) => meta,
+        Err(pack_dir_err) => match read_verify_pack_meta_from_zip(pack_zip) {
+            Ok(meta) => meta,
+            Err(pack_zip_err) => {
+                merged_error = merge_error(
+                    merged_error,
+                    format!(
+                        "failed to read decision pack metadata from pack_dir: {pack_dir_err:#}; fallback zip read also failed: {pack_zip_err:#}"
+                    ),
+                );
+                VerifyPackMeta {
+                    pack_type: String::new(),
+                    library: String::new(),
+                    client: String::new(),
+                    engagement: String::new(),
+                }
+            }
+        },
+    };
+
+    let meta_complete = verify_pack_meta_complete(&pack_meta);
+    let verifier_passed = verifier_ok
+        .or(verifier_status_success)
+        .unwrap_or(verifier_command_success);
+
+    let ok = verifier_command_success
+        && verifier_passed
+        && merged_error.is_none()
+        && meta_complete
+        && missing_files.is_empty()
+        && schema_errors.is_empty()
+        && mismatches.is_empty();
+
+    let pack_type = pack_meta.pack_type.clone();
+    let library = pack_meta.library.clone();
+    let client = pack_meta.client.clone();
+    let engagement = pack_meta.engagement.clone();
+
+    VerifyReport {
+        ok,
+        pack_zip: path_to_string(pack_zip),
+        pack_type,
+        library,
+        client,
+        engagement,
+        pack_meta,
+        missing_files,
+        schema_errors,
+        mismatches,
+        verifier_ok,
+        verifier_status_success,
+        verifier_error: merged_error,
+        verifier_json: verifier_json.clone(),
+    }
+}
+
+fn read_verify_pack_meta(pack_dir: &Path) -> Result<VerifyPackMeta> {
+    let decision_pack_path = pack_dir.join(DECISION_PACK_FILE);
+    let bytes = fs::read(&decision_pack_path)
+        .with_context(|| format!("failed to read {}", decision_pack_path.display()))?;
+    let value: Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse {}", decision_pack_path.display()))?;
+    parse_verify_pack_meta(&value, &decision_pack_path.display().to_string())
+}
+
+fn read_verify_pack_meta_from_zip(pack_zip: &Path) -> Result<VerifyPackMeta> {
+    let file = fs::File::open(pack_zip).with_context(|| {
+        format!(
+            "failed to read zip for pack metadata: {}",
+            pack_zip.display()
+        )
+    })?;
+    let mut archive = ZipArchive::new(file)
+        .with_context(|| format!("failed to open zip archive: {}", pack_zip.display()))?;
+    let mut decision_pack_index: Option<usize> = None;
+
+    for idx in 0..archive.len() {
+        let entry = archive.by_index(idx).with_context(|| {
+            format!(
+                "failed to scan zip entry index {idx} in {}",
+                pack_zip.display()
+            )
+        })?;
+        let entry_name = normalize_zip_entry_path(entry.name());
+        if entry_file_name(&entry_name).eq_ignore_ascii_case(DECISION_PACK_FILE) {
+            decision_pack_index = Some(idx);
+            break;
+        }
+    }
+
+    let index = decision_pack_index.ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} is missing from zip archive {}",
+            DECISION_PACK_FILE,
+            pack_zip.display()
+        )
+    })?;
+    let mut entry = archive.by_index(index).with_context(|| {
+        format!(
+            "failed to read zip entry index {index} from {}",
+            pack_zip.display()
+        )
+    })?;
+    let mut bytes = Vec::new();
+    entry.read_to_end(&mut bytes).with_context(|| {
+        format!(
+            "failed to read {} from zip archive {}",
+            DECISION_PACK_FILE,
+            pack_zip.display()
+        )
+    })?;
+    let value: Value = serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "failed to parse {} from zip archive {}",
+            DECISION_PACK_FILE,
+            pack_zip.display()
+        )
+    })?;
+    let source = format!("{}!{}", pack_zip.display(), DECISION_PACK_FILE);
+    parse_verify_pack_meta(&value, &source)
+}
+
+fn parse_verify_pack_meta(value: &Value, source: &str) -> Result<VerifyPackMeta> {
+    let read_field = |field: &str| -> Result<String> {
+        normalize_non_empty_metadata_value(
+            value
+                .pointer(&format!("/pack_meta/{field}"))
+                .and_then(Value::as_str),
+        )
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "pack metadata field '{}' is missing/blank in {}",
+                field,
+                source
+            )
+        })
+    };
+
+    Ok(VerifyPackMeta {
+        pack_type: read_field("pack_type")?,
+        library: read_field("library")?,
+        client: read_field("client")?,
+        engagement: read_field("engagement")?,
+    })
+}
+
+fn extract_verify_string_list(value: &Value, pointers: &[&str]) -> Vec<String> {
+    for pointer in pointers {
+        if let Some(items) = value.pointer(pointer).and_then(Value::as_array) {
+            let values = items
+                .iter()
+                .filter_map(|item| match item {
+                    Value::String(text) => normalize_non_empty_metadata_value(Some(text)),
+                    Value::Object(map) => {
+                        for key in ["message", "error", "path", "field"] {
+                            if let Some(text) = map
+                                .get(key)
+                                .and_then(Value::as_str)
+                                .and_then(|text| normalize_non_empty_metadata_value(Some(text)))
+                            {
+                                return Some(text);
+                            }
+                        }
+                        let rendered = item.to_string();
+                        normalize_non_empty_metadata_value(Some(rendered.as_str()))
+                    }
+                    _ => {
+                        let rendered = item.to_string();
+                        normalize_non_empty_metadata_value(Some(rendered.as_str()))
+                    }
+                })
+                .collect::<Vec<String>>();
+            return stable_unique_sorted_strings(values);
+        }
+    }
+    Vec::new()
+}
+
+fn merge_error(current: Option<String>, next: String) -> Option<String> {
+    let next = next.trim().to_string();
+    if next.is_empty() {
+        return current;
+    }
+    match current {
+        Some(current) if current.trim().is_empty() => Some(next),
+        Some(current) => Some(format!("{current}; {next}")),
+        None => Some(next),
+    }
+}
+
+fn verify_pack_meta_complete(meta: &VerifyPackMeta) -> bool {
+    !meta.pack_type.trim().is_empty()
+        && !meta.library.trim().is_empty()
+        && !meta.client.trim().is_empty()
+        && !meta.engagement.trim().is_empty()
 }
 
 fn build_self_drift_report(pack_dir: &Path) -> Result<DriftReportV1> {
@@ -2456,6 +3257,8 @@ fn build_replay_commands(context: &BundleContext) -> Vec<String> {
         path_to_string(&context.intake),
         "--out".to_string(),
         path_to_string(&context.pack_dir),
+        "--data-dir".to_string(),
+        path_to_string(&context.aegis_data_dir),
     ];
 
     let leo_pack = vec![
@@ -2843,6 +3646,54 @@ mod tests {
     }
 
     #[test]
+    fn infer_repo_data_dir_from_target_release_aegis_bin() {
+        let aegis_bin = PathBuf::from("repo")
+            .join("target")
+            .join("release")
+            .join("aegis.exe");
+        let resolved = infer_repo_data_dir_from_aegis_bin(&aegis_bin)
+            .expect("expected repo data dir for target/release layout");
+        let expected = normalize_lexical(&PathBuf::from("repo").join("data"));
+        assert_eq!(path_compare_key(&resolved), path_compare_key(&expected));
+        let wrong = normalize_lexical(
+            &PathBuf::from("repo")
+                .join("target")
+                .join("release")
+                .join("data"),
+        );
+        assert_ne!(path_compare_key(&resolved), path_compare_key(&wrong));
+    }
+
+    #[test]
+    fn infer_repo_data_dir_returns_none_for_packaged_layout() {
+        let aegis_bin = PathBuf::from("dist")
+            .join("tools")
+            .join("aegis")
+            .join("aegis.exe");
+        assert!(infer_repo_data_dir_from_aegis_bin(&aegis_bin).is_none());
+    }
+
+    #[test]
+    fn replay_command_always_includes_aegis_data_dir() {
+        let context = BundleContext {
+            out_dir: PathBuf::from("out"),
+            pack_dir: PathBuf::from("out").join("pack"),
+            vault: PathBuf::from("vault"),
+            intake: PathBuf::from("intake.json"),
+            cupola_bin: PathBuf::from("cupola-cli.exe"),
+            cupola_repo: PathBuf::from("."),
+            aegis_bin: PathBuf::from("aegis.exe"),
+            aegis_data_dir: PathBuf::from("aegis-data"),
+            query: "alpha".to_string(),
+            limit: 20,
+        };
+        let replay = build_replay_commands(&context);
+        assert_eq!(replay.len(), 3);
+        assert!(replay[1].contains("\"--data-dir\""));
+        assert!(replay[1].contains("\"aegis-data\""));
+    }
+
+    #[test]
     fn zip_file_count_matches_hash_listing_count() -> Result<()> {
         let temp_root = std::env::temp_dir().join(format!("leo-test-{}", Uuid::new_v4()));
         let pack_dir = temp_root.join("pack");
@@ -2861,6 +3712,175 @@ mod tests {
             fs::remove_dir_all(&temp_root)?;
         }
         Ok(())
+    }
+
+    #[test]
+    fn bundle_contains_latest_decision_pack_assets() -> Result<()> {
+        let temp_root =
+            std::env::temp_dir().join(format!("leo-test-bundle-assets-{}", Uuid::new_v4()));
+        let result = (|| -> Result<()> {
+            let pack_dir = temp_root.join("pack");
+            let decision_pack_dir = pack_dir.join("acme").join("eng42").join("PACK-001");
+            fs::create_dir_all(&decision_pack_dir)?;
+
+            let html_path = decision_pack_dir.join(DECISION_PACK_HTML_FILE);
+            let pdf_path = decision_pack_dir.join(DECISION_PACK_PDF_FILE);
+            let sha_path = decision_pack_dir.join(DECISION_PACK_PDF_SHA256_FILE);
+            fs::write(&html_path, "<html><body>final branded html</body></html>")?;
+            fs::write(&pdf_path, b"%PDF-1.7\nfinal rendered bytes\n")?;
+            let pdf_sha = sha256_file(&pdf_path)?;
+            fs::write(&sha_path, format!("{pdf_sha}  {}\n", pdf_path.display()))?;
+            fs::write(
+                decision_pack_dir.join(DECISION_PACK_MANIFEST_FILE),
+                r#"{"schema_version":"aegis.manifest.v1.1"}"#,
+            )?;
+            fs::write(
+                decision_pack_dir.join(DECISION_PACK_SEAL_FILE),
+                r#"{"schema_version":"aegis.seal.v1"}"#,
+            )?;
+            write_json_pretty(
+                &pack_dir.join(DECISION_PACK_FILE),
+                &json!({
+                    "schema_version": DECISION_PACK_SCHEMA,
+                    "pack_meta": {
+                        "pack_type": "trust_audit",
+                        "library": "vendorsecurity/v1",
+                        "client": "acme",
+                        "engagement": "eng42"
+                    }
+                }),
+            )?;
+            write_json_pretty(
+                &pack_dir.join(CLAIMS_FILE),
+                &json!({
+                    "schema_version": CLAIMS_SCHEMA,
+                    "generated_at": "2026-02-20T00:00:00Z",
+                    "claims": []
+                }),
+            )?;
+
+            let zip_path = temp_root.join(PACK_FILE);
+            bundle_pack_directory(&pack_dir, &zip_path)?;
+
+            let html_zip =
+                read_zip_entry_bytes(&zip_path, "acme/eng42/PACK-001/DecisionPack.html")?;
+            let pdf_zip = read_zip_entry_bytes(&zip_path, "acme/eng42/PACK-001/DecisionPack.pdf")?;
+            assert_eq!(sha256_file(&html_path)?, sha256_bytes(&html_zip));
+            assert_eq!(sha256_file(&pdf_path)?, sha256_bytes(&pdf_zip));
+
+            let _ = read_zip_entry_bytes(&zip_path, "acme/eng42/PACK-001/SHA256.txt")?;
+            let _ =
+                read_zip_entry_bytes(&zip_path, "acme/eng42/PACK-001/DecisionPack.manifest.json")?;
+            let _ = read_zip_entry_bytes(&zip_path, "acme/eng42/PACK-001/DecisionPack.seal.json")?;
+            let _ = read_zip_entry_bytes(&zip_path, DECISION_PACK_FILE)?;
+            let _ = read_zip_entry_bytes(&zip_path, CLAIMS_FILE)?;
+            Ok(())
+        })();
+
+        if temp_root.exists() {
+            let _ = fs::remove_dir_all(&temp_root);
+        }
+        result
+    }
+
+    #[test]
+    fn verify_step_reports_missing_html_when_bundling_skipped() -> Result<()> {
+        let temp_root =
+            std::env::temp_dir().join(format!("leo-test-run-missing-html-{}", Uuid::new_v4()));
+        let result = (|| -> Result<()> {
+            let out_dir = temp_root.join("out");
+            let logs_dir = out_dir.join("_logs");
+            let pack_dir = out_dir.join("pack");
+            let decision_pack_dir = pack_dir.join("acme").join("eng42").join("PACK-001");
+            fs::create_dir_all(&logs_dir)?;
+            fs::create_dir_all(&decision_pack_dir)?;
+
+            fs::write(
+                decision_pack_dir.join(DECISION_PACK_PDF_FILE),
+                b"%PDF-1.7\n",
+            )?;
+            fs::write(
+                decision_pack_dir.join(DECISION_PACK_PDF_SHA256_FILE),
+                "placeholder-sha\n",
+            )?;
+            write_json_pretty(
+                &pack_dir.join(DECISION_PACK_FILE),
+                &json!({
+                    "schema_version": DECISION_PACK_SCHEMA,
+                    "pack_meta": {
+                        "pack_type": "trust_audit",
+                        "library": "vendorsecurity/v1",
+                        "client": "acme",
+                        "engagement": "eng42"
+                    }
+                }),
+            )?;
+
+            let package_error = bundle_skip_reason_for_failed_steps(&pack_dir);
+            assert!(
+                package_error.contains(DECISION_PACK_HTML_FILE),
+                "expected package error to mention missing html, got: {package_error}"
+            );
+
+            let pack_zip = out_dir.join(PACK_FILE);
+            let verify_step = execute_verify_pack_step(
+                StepSpec {
+                    step_id: "step-04-verify",
+                    tool: "epi-cli",
+                    cwd: out_dir.clone(),
+                    argv: vec![
+                        "epi-cli".to_string(),
+                        "verify".to_string(),
+                        path_to_string(&pack_zip),
+                        "--json".to_string(),
+                    ],
+                },
+                &out_dir,
+                &logs_dir,
+                &pack_dir,
+                &pack_zip,
+                Some(package_error.as_str()),
+            )?;
+            assert_eq!(verify_step.status, "error");
+
+            let verify_path = out_dir.join(VERIFY_FILE);
+            let verify_json: Value = serde_json::from_slice(&fs::read(&verify_path)?)?;
+            assert_eq!(
+                verify_json.pointer("/ok").and_then(Value::as_bool),
+                Some(false)
+            );
+            assert_eq!(
+                verify_json.pointer("/pack_type").and_then(Value::as_str),
+                Some("trust_audit")
+            );
+            assert_eq!(
+                verify_json.pointer("/library").and_then(Value::as_str),
+                Some("vendorsecurity/v1")
+            );
+            assert_eq!(
+                verify_json.pointer("/client").and_then(Value::as_str),
+                Some("acme")
+            );
+            assert_eq!(
+                verify_json.pointer("/engagement").and_then(Value::as_str),
+                Some("eng42")
+            );
+            let verifier_error = verify_json
+                .pointer("/verifier_error")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            assert!(
+                verifier_error.contains(DECISION_PACK_HTML_FILE),
+                "expected verifier_error to mention missing html, got: {verifier_error}"
+            );
+            Ok(())
+        })();
+
+        if temp_root.exists() {
+            let _ = fs::remove_dir_all(&temp_root);
+        }
+        result
     }
 
     #[test]
@@ -2992,6 +4012,7 @@ mod tests {
                 cupola_bin: PathBuf::from("cupola-cli.exe"),
                 cupola_repo: PathBuf::from("."),
                 aegis_bin: PathBuf::from("aegis.exe"),
+                aegis_data_dir: PathBuf::from("data"),
                 query: "alpha".to_string(),
                 limit: 20,
             };
@@ -3002,6 +4023,72 @@ mod tests {
             assert_eq!(decision_pack.pack_meta.client, "acme");
             assert_eq!(decision_pack.pack_meta.engagement, "eng42");
             assert_eq!(decision_pack.pack_meta.pack_id.as_deref(), Some("PACK-001"));
+            Ok(())
+        })();
+
+        if temp_root.exists() {
+            let _ = fs::remove_dir_all(&temp_root);
+        }
+        result
+    }
+
+    #[test]
+    fn prerender_stub_is_written_when_decision_pack_json_is_missing() -> Result<()> {
+        let temp_root =
+            std::env::temp_dir().join(format!("leo-test-prerender-stub-{}", Uuid::new_v4()));
+        let result = (|| -> Result<()> {
+            let pack_dir = temp_root.join("pack");
+            let decision_pack_dir = pack_dir
+                .join("civitasanalytica")
+                .join("self-audit")
+                .join("PACK-001");
+            fs::create_dir_all(&decision_pack_dir)?;
+            fs::write(
+                decision_pack_dir.join(DECISION_PACK_HTML_FILE),
+                "<html><body>DecisionPack</body></html>",
+            )?;
+
+            let intake = json!({
+                "schema_version": "aegis.intake.v1",
+                "pack_type": "trust_audit",
+                "library_pack": "vendor_security",
+                "client_id": "civitasanalytica",
+                "engagement_id": "self-audit"
+            });
+            let intake_path = temp_root.join("intake.json");
+            write_json_pretty(&intake_path, &intake)?;
+
+            let stub_path = pack_dir.join(DECISION_PACK_FILE);
+            assert!(!stub_path.exists());
+            write_prerender_decision_pack_stub(&pack_dir, &intake_path)?;
+            assert!(stub_path.is_file());
+
+            let stub: Value = serde_json::from_slice(&fs::read(&stub_path)?)?;
+            assert_eq!(
+                stub.pointer("/schema_version").and_then(Value::as_str),
+                Some(DECISION_PACK_SCHEMA)
+            );
+
+            for (field, expected) in [
+                ("pack_type", "trust_audit"),
+                ("library", "vendor_security"),
+                ("client", "civitasanalytica"),
+                ("engagement", "self-audit"),
+            ] {
+                let pointer = format!("/pack_meta/{field}");
+                let actual = stub
+                    .pointer(&pointer)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                assert!(
+                    !actual.is_empty(),
+                    "expected /pack_meta/{field} to be non-empty in {}",
+                    stub_path.display()
+                );
+                assert_eq!(actual, expected);
+            }
             Ok(())
         })();
 
@@ -3048,6 +4135,7 @@ mod tests {
                 cupola_bin: PathBuf::from("cupola-cli.exe"),
                 cupola_repo: PathBuf::from("."),
                 aegis_bin: PathBuf::from("aegis.exe"),
+                aegis_data_dir: PathBuf::from("data"),
                 query: "alpha".to_string(),
                 limit: 20,
             };
@@ -3111,6 +4199,7 @@ mod tests {
                 cupola_bin: PathBuf::from("cupola-cli.exe"),
                 cupola_repo: PathBuf::from("."),
                 aegis_bin: PathBuf::from("aegis.exe"),
+                aegis_data_dir: PathBuf::from("data"),
                 query: "alpha".to_string(),
                 limit: 20,
             };
@@ -3134,6 +4223,100 @@ mod tests {
                     decision_pack_path.display()
                 );
             }
+            Ok(())
+        })();
+
+        if temp_root.exists() {
+            let _ = fs::remove_dir_all(&temp_root);
+        }
+        result
+    }
+
+    #[test]
+    fn verify_report_ok_when_verifier_succeeds_and_pack_meta_present() -> Result<()> {
+        let temp_root = std::env::temp_dir().join(format!("leo-test-verify-ok-{}", Uuid::new_v4()));
+        let result = (|| -> Result<()> {
+            let pack_dir = temp_root.join("pack");
+            fs::create_dir_all(&pack_dir)?;
+            write_json_pretty(
+                &pack_dir.join(DECISION_PACK_FILE),
+                &json!({
+                    "schema_version": DECISION_PACK_SCHEMA,
+                    "pack_meta": {
+                        "pack_type": "trust_audit",
+                        "library": "vendorsecurity/v1",
+                        "client": "acme",
+                        "engagement": "eng42"
+                    }
+                }),
+            )?;
+
+            let verifier_json = json!({
+                "status": {"success": true},
+                "missing_files": [],
+                "invalid_json": [],
+                "schema_version_mismatches": []
+            });
+            let report = build_verify_report(
+                &temp_root.join(PACK_FILE),
+                &pack_dir,
+                &verifier_json,
+                true,
+                None,
+            );
+            assert!(report.ok, "expected verification to pass: {report:?}");
+            assert_eq!(report.pack_type, "trust_audit");
+            assert_eq!(report.library, "vendorsecurity/v1");
+            assert_eq!(report.client, "acme");
+            assert_eq!(report.engagement, "eng42");
+            assert_eq!(report.pack_meta.pack_type, "trust_audit");
+            assert_eq!(report.pack_meta.library, "vendorsecurity/v1");
+            assert_eq!(report.pack_meta.client, "acme");
+            assert_eq!(report.pack_meta.engagement, "eng42");
+            Ok(())
+        })();
+
+        if temp_root.exists() {
+            let _ = fs::remove_dir_all(&temp_root);
+        }
+        result
+    }
+
+    #[test]
+    fn verify_report_fails_when_missing_files_present() -> Result<()> {
+        let temp_root =
+            std::env::temp_dir().join(format!("leo-test-verify-missing-{}", Uuid::new_v4()));
+        let result = (|| -> Result<()> {
+            let pack_dir = temp_root.join("pack");
+            fs::create_dir_all(&pack_dir)?;
+            write_json_pretty(
+                &pack_dir.join(DECISION_PACK_FILE),
+                &json!({
+                    "schema_version": DECISION_PACK_SCHEMA,
+                    "pack_meta": {
+                        "pack_type": "trust_audit",
+                        "library": "vendorsecurity/v1",
+                        "client": "acme",
+                        "engagement": "eng42"
+                    }
+                }),
+            )?;
+
+            let verifier_json = json!({
+                "status": {"success": true},
+                "missing_files": ["epi.claims.v1.json"],
+                "invalid_json": [],
+                "schema_version_mismatches": []
+            });
+            let report = build_verify_report(
+                &temp_root.join(PACK_FILE),
+                &pack_dir,
+                &verifier_json,
+                true,
+                None,
+            );
+            assert!(!report.ok, "expected verification to fail: {report:?}");
+            assert_eq!(report.missing_files, vec!["epi.claims.v1.json".to_string()]);
             Ok(())
         })();
 
@@ -3364,6 +4547,15 @@ mod tests {
         assert_eq!(report.drift_summary.by_impact.high, 1);
         assert_eq!(report.drift_summary.by_impact.medium, 1);
         assert_eq!(report.drift_summary.by_impact.low, 1);
+    }
+
+    fn read_zip_entry_bytes(zip_path: &Path, rel_path: &str) -> Result<Vec<u8>> {
+        let file = fs::File::open(zip_path)?;
+        let mut archive = zip::ZipArchive::new(file)?;
+        let mut entry = archive.by_name(rel_path)?;
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes)?;
+        Ok(bytes)
     }
 
     fn zip_entry_count(zip_path: &Path) -> Result<usize> {

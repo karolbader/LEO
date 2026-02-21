@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" fill="none" aria-label="Civitas Analytica Logo" id="civitas-mark-v1">
+  <path d="M50 5 L10 25 L10 70 C10 85 30 95 50 100 C70 95 90 85 90 70 L90 25 Z" fill="#0B1120"/>
+  <g id="stack-layer-bottom">
+    <path d="M50 44 L74 56 L50 68 L26 56 Z" fill="#1E293B"/>
+    <path d="M26 56 L50 68 L50 76 L26 64 Z" fill="#020617"/>
+    <path d="M74 56 L50 68 L50 76 L74 64 Z" fill="#0F172A"/>
+  </g>
+  <g id="stack-layer-middle">
+    <path d="M50 32 L74 44 L50 56 L26 44 Z" fill="#334155"/>
+    <path d="M26 44 L50 56 L50 64 L26 52 Z" fill="#0F172A"/>
+    <path d="M74 44 L50 56 L50 64 L74 52 Z" fill="#1E293B"/>
+  </g>
+  <g id="stack-layer-top">
+    <path d="M50 20 L74 32 L50 44 L26 32 Z" fill="#F8FAFC"/>
+    <path d="M26 32 L50 44 L50 52 L26 40 Z" fill="#94A3B8"/>
+    <path d="M74 32 L50 44 L50 52 L74 40 Z" fill="#CBD5E1"/>
+  </g>
+  <g id="north-star">
+    <path d="M50 25 L51.5 30.5 L57 32 L51.5 33.5 L50 39 L48.5 33.5 L43 32 L48.5 30.5 Z" fill="#2563EB"/>
+    <path d="M50 27 L51 31 L55 32 L51 33 L50 37 L49 33 L45 32 L49 31 Z" fill="#60A5FA"/>
+  </g>
+</svg>

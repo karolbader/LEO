@@ -51,6 +51,7 @@ try {
     $cupolaExe = Join-Path $leoRoot "dist\LEO\tools\cupola\cupola-cli.exe"
     $aegisDistExe = Join-Path $leoRoot "dist\LEO\tools\aegis\aegis.exe"
     $pdfRenderer = Join-Path $leoRoot "scripts\render_decision_pack_pdf.mjs"
+    $civitasMarkSvg = Join-Path $leoRoot "scripts\assets\civitas-mark.svg"
     $fontRegular = Join-Path $leoRoot "scripts\fonts\SourceSans3-Regular.otf"
     $fontBold = Join-Path $leoRoot "scripts\fonts\SourceSans3-Bold.otf"
     $fontItalic = Join-Path $leoRoot "scripts\fonts\SourceSans3-It.otf"
@@ -58,6 +59,7 @@ try {
     Require-File -Path $cupolaExe -Label "cupola-cli.exe"
     Require-File -Path $aegisDistExe -Label "aegis.exe"
     Require-File -Path $pdfRenderer -Label "render_decision_pack_pdf.mjs"
+    Require-File -Path $civitasMarkSvg -Label "civitas-mark.svg"
     Require-File -Path $fontRegular -Label "SourceSans3-Regular.otf"
     Require-File -Path $fontBold -Label "SourceSans3-Bold.otf"
     Require-File -Path $fontItalic -Label "SourceSans3-It.otf"
@@ -162,10 +164,6 @@ Incident response runbooks are maintained and tested quarterly.
             $pdfRenderer,
             "--html", $decisionPackHtml.FullName,
             "--pdf", $decisionPackPdf,
-            "--library", $libraryId,
-            "--client", $clientId,
-            "--engagement", $engagementId,
-            "--pack-id", $packId,
             "--font-regular", $fontRegular,
             "--font-bold", $fontBold,
             "--font-italic", $fontItalic
@@ -175,6 +173,13 @@ Incident response runbooks are maintained and tested quarterly.
         $pdfSize = (Get-Item -LiteralPath $decisionPackPdf).Length
         if ($pdfSize -le 51200) {
             throw "DecisionPack.pdf is too small ($pdfSize bytes): $decisionPackPdf"
+        }
+        $decisionPackHtmlContent = Get-Content -Raw -LiteralPath $decisionPackHtml.FullName
+        if ($decisionPackHtmlContent -notmatch 'data-civitas-brand="civitas-mark-v1"') {
+            throw "DecisionPack.html is missing Civitas brand marker after PDF render: $($decisionPackHtml.FullName)"
+        }
+        if ($decisionPackHtmlContent -notmatch 'id="civitas-mark-v1"') {
+            throw "DecisionPack.html is missing inline Civitas mark SVG after PDF render: $($decisionPackHtml.FullName)"
         }
 
         $pdfHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $decisionPackPdf).Hash.ToLowerInvariant()
@@ -217,6 +222,13 @@ Incident response runbooks are maintained and tested quarterly.
         $pdfSizeAfterPack = $decisionPackPdfAfterPack.Length
         if ($pdfSizeAfterPack -le 51200) {
             throw "DecisionPack.pdf is too small after pack ($pdfSizeAfterPack bytes): $($decisionPackPdfAfterPack.FullName)"
+        }
+        $decisionPackHtmlContentAfterPack = Get-Content -Raw -LiteralPath $decisionPackHtmlAfterPack.FullName
+        if ($decisionPackHtmlContentAfterPack -notmatch 'data-civitas-brand="civitas-mark-v1"') {
+            throw "DecisionPack.html is missing Civitas brand marker after pack: $($decisionPackHtmlAfterPack.FullName)"
+        }
+        if ($decisionPackHtmlContentAfterPack -notmatch 'id="civitas-mark-v1"') {
+            throw "DecisionPack.html is missing inline Civitas mark SVG after pack: $($decisionPackHtmlAfterPack.FullName)"
         }
         $pdfHashAfterPack = (Get-FileHash -Algorithm SHA256 -LiteralPath $decisionPackPdfAfterPack.FullName).Hash.ToLowerInvariant()
         $shaLine = (Get-Content -LiteralPath $decisionPackSha -ErrorAction Stop | Select-Object -First 1).Trim()
