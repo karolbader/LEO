@@ -648,10 +648,10 @@ a {
       headerTemplate,
       footerTemplate,
       margin: {
-        top: "22mm",
-        right: "12mm",
-        bottom: "18mm",
-        left: "12mm",
+        top: "0",
+        right: "0",
+        bottom: "0",
+        left: "0",
       },
       preferCSSPageSize: true,
     });

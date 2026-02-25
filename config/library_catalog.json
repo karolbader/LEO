@@ -1,0 +1,37 @@
+[
+  {
+    "id": "vendorsecurity/v1",
+    "meta": "vendorsecurity-v1",
+    "safe": "vendorsecurity-v1",
+    "display_name": "Vendor Security v1",
+    "status": "standard"
+  },
+  {
+    "id": "dfir-lite/v1",
+    "meta": "dfir-lite-v1",
+    "safe": "dfir-lite-v1",
+    "display_name": "DFIR Lite v1",
+    "status": "standard"
+  },
+  {
+    "id": "iso27001-lite/v1",
+    "meta": "iso27001-lite-v1",
+    "safe": "iso27001-lite-v1",
+    "display_name": "ISO 27001 Lite v1",
+    "status": "standard"
+  },
+  {
+    "id": "soc_2",
+    "meta": "soc2",
+    "safe": "soc2",
+    "display_name": "SOC 2 Readiness",
+    "status": "standard"
+  },
+  {
+    "id": "nist_csf",
+    "meta": "nist-csf",
+    "safe": "nist-csf",
+    "display_name": "NIST CSF Readiness",
+    "status": "standard"
+  }
+]

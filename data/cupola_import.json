@@ -1,0 +1,62 @@
+{
+  "schema_version": "1.0.0",
+  "tool": {
+    "name": "cupola-cli",
+    "version": "0.1.0",
+    "build": "debug",
+    "platform": "windows-x64"
+  },
+  "generated_at": "2026-02-24T23:57:09.688912800+00:00",
+  "vault": {
+    "vault_path": "E:\\_packs\\_demo_vault",
+    "vault_id": null
+  },
+  "query": "vendor security due diligence process",
+  "limit": 5,
+  "hits": [
+    {
+      "chunk_id": "1589c73de6d482473c05398556f2944bdb2fd09ea946284f1e1cdbd7f94e2b08",
+      "rel_path": "evidence/controls.json",
+      "file_type": "json",
+      "mtime_ns": 1771617113902023400,
+      "raw_blob_id": "58c7ccaaf523c882950209919449f8cf3b81e4dc773008624638d52f8803121d",
+      "chunk_blob_id": "58c7ccaaf523c882950209919449f8cf3b81e4dc773008624638d52f8803121d",
+      "start_line": 1,
+      "end_line": 6,
+      "excerpt": "{   \"controls\": [     { \"id\": \"CTRL-001\", \"status\": \"implemented\", \"owner\": \"security\" },     { \"id\": \"CTRL-002\", \"status\": \"monitoring\", \"owner\": \"platform\" }   ] }\r "
+    },
+    {
+      "chunk_id": "95b15a277365402bd469811a9eb67139f0c47c9544b9097387afb8e3c3f1a167",
+      "rel_path": "evidence/controls.json",
+      "file_type": "json",
+      "mtime_ns": 1771975015429031600,
+      "raw_blob_id": "3d9c69862ff49bcc1628af331ea83a9678e449c4c3fb05f09e090c8c4f4d7d41",
+      "chunk_blob_id": "3d9c69862ff49bcc1628af331ea83a9678e449c4c3fb05f09e090c8c4f4d7d41",
+      "start_line": 1,
+      "end_line": 6,
+      "excerpt": "{\r   \"controls\": [\r     { \"id\": \"CTRL-001\", \"status\": \"implemented\", \"owner\": \"security\" },\r     { \"id\": \"CTRL-002\", \"status\": \"monitoring\", \"owner\": \"platform\" }\r   ]\r }\r "
+    },
+    {
+      "chunk_id": "1858fbc80353f31f22594ae7a65f3e70c4582eed385c28837bb03d987df85434",
+      "rel_path": "docs/security-policy.md",
+      "file_type": "md",
+      "mtime_ns": 1771617113902023400,
+      "raw_blob_id": "1fad6294b9cf7dfe3a80f6b6b1f195afec5534eb057ab1eb6f498473ad6944d7",
+      "chunk_blob_id": "1b7ae6c0b13fc71636b82193eb6cf86cf5116ecd870f970d4f168ce9df4f32c9",
+      "start_line": 1,
+      "end_line": 4,
+      "excerpt": "# Security Policy  All privileged access requires approval and periodic review. Incident response runbooks are maintained and tested quarterly."
+    },
+    {
+      "chunk_id": "4d298626940c4c4a334229dc536409a92938f1b1846b86d06f8856067c5245c8",
+      "rel_path": "docs/security-policy.md",
+      "file_type": "md",
+      "mtime_ns": 1771975015429031600,
+      "raw_blob_id": "7d963f2254ab35f48b2df3502b867f13f61cd5fa1953ec067e5374b4da56dafb",
+      "chunk_blob_id": "1b7ae6c0b13fc71636b82193eb6cf86cf5116ecd870f970d4f168ce9df4f32c9",
+      "start_line": 1,
+      "end_line": 4,
+      "excerpt": "# Security Policy  All privileged access requires approval and periodic review. Incident response runbooks are maintained and tested quarterly."
+    }
+  ]
+}

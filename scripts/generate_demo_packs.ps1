@@ -46,7 +46,8 @@ try {
     $aegisRoot = Join-Path $productsRoot "aegis"
     $packsRoot = "E:\_packs"
     $vaultRoot = Join-Path $packsRoot "_demo_vault"
-    $cupolaRepo = "E:\CupolaCore"
+    $cupolaRepoDefault = "E:\Sanctuary\products\epi-rail\cupola-core"
+    $cupolaRepo = if ([string]::IsNullOrWhiteSpace($env:CUPOLA_REPO)) { $cupolaRepoDefault } else { $env:CUPOLA_REPO }
 
     $cupolaExe = Join-Path $leoRoot "dist\LEO\tools\cupola\cupola-cli.exe"
     $aegisDistExe = Join-Path $leoRoot "dist\LEO\tools\aegis\aegis.exe"
@@ -55,6 +56,7 @@ try {
     $fontRegular = Join-Path $leoRoot "scripts\fonts\SourceSans3-Regular.otf"
     $fontBold = Join-Path $leoRoot "scripts\fonts\SourceSans3-Bold.otf"
     $fontItalic = Join-Path $leoRoot "scripts\fonts\SourceSans3-It.otf"
+    $libraryCatalogPath = Join-Path $leoRoot "config\library_catalog.json"
 
     Require-File -Path $cupolaExe -Label "cupola-cli.exe"
     Require-File -Path $aegisDistExe -Label "aegis.exe"
@@ -63,8 +65,12 @@ try {
     Require-File -Path $fontRegular -Label "SourceSans3-Regular.otf"
     Require-File -Path $fontBold -Label "SourceSans3-Bold.otf"
     Require-File -Path $fontItalic -Label "SourceSans3-It.otf"
+    Require-File -Path $libraryCatalogPath -Label "library_catalog.json"
     Require-File -Path (Join-Path $aegisRoot "Cargo.toml") -Label "aegis Cargo.toml"
     Require-File -Path (Join-Path $leoRoot "Cargo.toml") -Label "leo Cargo.toml"
+    if (-not (Test-Path -LiteralPath $cupolaRepo -PathType Container)) {
+        throw "Cupola repo path does not exist: $cupolaRepo`nOverride with env var CUPOLA_REPO (example: `$env:CUPOLA_REPO='E:\Sanctuary\products\cupola-core')."
+    }
 
     New-Item -ItemType Directory -Path $packsRoot -Force | Out-Null
     New-Item -ItemType Directory -Path $vaultRoot -Force | Out-Null
@@ -92,9 +98,8 @@ Incident response runbooks are maintained and tested quarterly.
 "@
 
     $libraries = @(
-        @{ Id = "vendorsecurity/v1"; Meta = "vendorsecurity-v1"; Safe = "vendorsecurity-v1" },
-        @{ Id = "dfir-lite/v1"; Meta = "dfir-lite-v1"; Safe = "dfir-lite-v1" },
-        @{ Id = "iso27001-lite/v1"; Meta = "iso27001-lite-v1"; Safe = "iso27001-lite-v1" }
+        (Get-Content -Raw -LiteralPath $libraryCatalogPath | ConvertFrom-Json) |
+            Where-Object { $_.status -eq "standard" }
     )
 
     foreach ($library in $libraries) {
@@ -150,6 +155,18 @@ Incident response runbooks are maintained and tested quarterly.
             "--out", $packRoot
         ) -Workdir $aegisRoot | Out-Null
 
+        $prerenderDecisionPack = [ordered]@{
+            schema_version = "epi.decision_pack.v1"
+            pack_meta = [ordered]@{
+                pack_type = "demo"
+                library = $libraryMetaId
+                client = $clientId
+                engagement = $engagementId
+                pack_id = $packId
+            }
+        }
+        $prerenderDecisionPack | ConvertTo-Json -Depth 16 | Set-Content -LiteralPath (Join-Path $packRoot "epi.decision_pack.v1.json")
+
         $decisionPackHtml = Get-ChildItem -LiteralPath $packRoot -Recurse -File -Filter "DecisionPack.html" |
             Select-Object -First 1
         if ($null -eq $decisionPackHtml) {
@@ -188,6 +205,7 @@ Incident response runbooks are maintained and tested quarterly.
 
         Invoke-Native -Exe "cargo" -Args @(
             "run",
+            "--bin", "leo",
             "--",
             "pack",
             "--vault", $vaultRoot,

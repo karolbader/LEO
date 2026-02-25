@@ -378,6 +378,7 @@ struct StepSpec {
     tool: &'static str,
     cwd: PathBuf,
     argv: Vec<String>,
+    env: Vec<(String, String)>,
 }
 
 struct BundleContext {
@@ -458,20 +459,25 @@ fn run(args: RunArgs) -> Result<()> {
     let cupola_bin = require_tool_binary(&tools.cupola)?;
     let aegis_bin = require_tool_binary(&tools.aegis)?;
     let epi_bin = require_tool_binary(&tools.epi)?;
+    let vault_path = absolutize(&args.vault)?;
+    let intake_path = absolutize(&args.intake)?;
     let out_dir = absolutize(&args.out)?;
     let cupola_repo_for_aegis = resolve_cupola_repo_for_aegis(&cupola_bin);
     let aegis_data_dir = resolve_aegis_data_dir(&aegis_bin)?;
-    ensure_outside_vault(&args.vault, &out_dir)?;
+    ensure_outside_vault(&vault_path, &out_dir)?;
 
     fs::create_dir_all(&out_dir)
         .with_context(|| format!("failed to create out dir: {}", out_dir.display()))?;
 
     let logs_dir = out_dir.join("_logs");
     let pack_dir = out_dir.join("pack");
+    let appdata_dir = out_dir.join("_appdata");
     fs::create_dir_all(&logs_dir)
         .with_context(|| format!("failed to create logs dir: {}", logs_dir.display()))?;
     fs::create_dir_all(&pack_dir)
         .with_context(|| format!("failed to create pack dir: {}", pack_dir.display()))?;
+    fs::create_dir_all(&appdata_dir)
+        .with_context(|| format!("failed to create appdata dir: {}", appdata_dir.display()))?;
 
     let tool_versions = ToolVersions {
         cupola_cli: detect_tool_version(&cupola_bin),
@@ -483,7 +489,7 @@ fn run(args: RunArgs) -> Result<()> {
         path_to_string(&cupola_bin),
         "export-epi".to_string(),
         "--vault".to_string(),
-        path_to_string(&args.vault),
+        path_to_string(&vault_path),
         "--out".to_string(),
         path_to_string(&pack_dir),
         "--query".to_string(),
@@ -496,18 +502,30 @@ fn run(args: RunArgs) -> Result<()> {
         path_to_string(&aegis_bin),
         "run".to_string(),
         "--vault".to_string(),
-        path_to_string(&args.vault),
-        "--cupola-repo".to_string(),
-        path_to_string(&cupola_repo_for_aegis),
+        path_to_string(&vault_path),
         "--intake".to_string(),
-        path_to_string(&args.intake),
+        path_to_string(&intake_path),
         "--out".to_string(),
         path_to_string(&pack_dir),
         "--data-dir".to_string(),
         path_to_string(&aegis_data_dir),
     ];
+    let mut runtime_env = runtime_env_overrides(&appdata_dir);
+    if let Some(contracts_v1_dir) = resolve_epi_contracts_v1_dir(&tools.leo_root) {
+        runtime_env.push((
+            "EPI_CONTRACTS_V1_DIR".to_string(),
+            path_to_string(&contracts_v1_dir),
+        ));
+    }
+    let mut aegis_env = runtime_env.clone();
+    aegis_env.extend(aegis_env_overrides(
+        &cupola_bin,
+        &aegis_bin,
+        &epi_bin,
+        &tools.leo_root,
+    ));
     let cupola_cwd = command_working_dir_for_binary(&cupola_bin)?;
-    let aegis_cwd = out_dir.clone();
+    let aegis_cwd = tools.leo_root.clone();
     let epi_cwd = command_working_dir_for_binary(&epi_bin)?;
 
     let mut steps = Vec::new();
@@ -517,6 +535,7 @@ fn run(args: RunArgs) -> Result<()> {
             tool: "cupola-cli",
             cwd: cupola_cwd,
             argv: cupola_argv.clone(),
+            env: runtime_env.clone(),
         },
         &out_dir,
         &logs_dir,
@@ -531,6 +550,7 @@ fn run(args: RunArgs) -> Result<()> {
             tool: "aegis",
             cwd: aegis_cwd,
             argv: aegis_argv.clone(),
+            env: aegis_env,
         },
         &out_dir,
         &logs_dir,
@@ -542,13 +562,14 @@ fn run(args: RunArgs) -> Result<()> {
 
     let render_step = execute_render_pdf_step(
         &tools.leo_root,
-        &args.intake,
+        &intake_path,
         aegis_ok,
         StepSpec {
             step_id: "step-03-render-pdf",
             tool: "node",
             cwd: tools.leo_root.clone(),
             argv: vec!["node".to_string(), PDF_RENDER_SCRIPT_REL.to_string()],
+            env: Vec::new(),
         },
         &out_dir,
         &logs_dir,
@@ -563,8 +584,8 @@ fn run(args: RunArgs) -> Result<()> {
         run_id: Uuid::new_v4().to_string(),
         created_at: now_rfc3339_utc(),
         inputs: RunInputs {
-            vault: path_to_string(&absolutize(&args.vault)?),
-            intake: path_to_string(&absolutize(&args.intake)?),
+            vault: path_to_string(&vault_path),
+            intake: path_to_string(&intake_path),
             out_dir: path_to_string(&out_dir),
             playbook_id: PLAYBOOK_ID.to_string(),
             tool_versions,
@@ -582,8 +603,8 @@ fn run(args: RunArgs) -> Result<()> {
     let bundle_context = BundleContext {
         out_dir: out_dir.clone(),
         pack_dir: pack_dir.clone(),
-        vault: args.vault.clone(),
-        intake: args.intake.clone(),
+        vault: vault_path,
+        intake: intake_path,
         cupola_bin,
         cupola_repo: cupola_repo_for_aegis,
         aegis_bin,
@@ -610,6 +631,7 @@ fn run(args: RunArgs) -> Result<()> {
                 path_to_string(&pack_zip),
                 "--json".to_string(),
             ],
+            env: runtime_env,
         },
         &out_dir,
         &logs_dir,
@@ -631,9 +653,11 @@ fn pack_only(args: PackArgs) -> Result<()> {
     let cupola_bin = require_tool_binary(&tools.cupola)?;
     let aegis_bin = require_tool_binary(&tools.aegis)?;
     let aegis_data_dir = resolve_aegis_data_dir(&aegis_bin)?;
+    let vault_path = absolutize(&args.vault)?;
+    let intake_path = absolutize(&args.intake)?;
     let out_dir = absolutize(&args.out)?;
     let cupola_repo_for_aegis = resolve_cupola_repo_for_aegis(&cupola_bin);
-    ensure_outside_vault(&args.vault, &out_dir)?;
+    ensure_outside_vault(&vault_path, &out_dir)?;
     let pack_dir = out_dir.join("pack");
     if !pack_dir.exists() {
         bail!("pack staging folder is missing: {}", pack_dir.display());
@@ -642,8 +666,8 @@ fn pack_only(args: PackArgs) -> Result<()> {
     let bundle_context = BundleContext {
         out_dir,
         pack_dir,
-        vault: args.vault,
-        intake: args.intake,
+        vault: vault_path,
+        intake: intake_path,
         cupola_bin,
         cupola_repo: cupola_repo_for_aegis,
         aegis_bin,
@@ -1134,6 +1158,46 @@ fn validate_aegis_data_dir(candidate: &Path, source: &str, attempts: &[String]) 
     Ok(normalized)
 }
 
+fn runtime_env_overrides(appdata_dir: &Path) -> Vec<(String, String)> {
+    vec![("APPDATA".to_string(), path_to_string(appdata_dir))]
+}
+
+fn resolve_epi_contracts_v1_dir(leo_root: &Path) -> Option<PathBuf> {
+    let candidate = normalize_lexical(&leo_root.join("contracts").join("v1"));
+    if candidate.is_dir() {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
+fn aegis_env_overrides(
+    cupola_bin: &Path,
+    aegis_bin: &Path,
+    epi_bin: &Path,
+    cargo_shim_dir: &Path,
+) -> Vec<(String, String)> {
+    let cupola_path = path_to_string(cupola_bin);
+    let existing_path = std::env::var("PATH").unwrap_or_default();
+    let shim_path = path_to_string(cargo_shim_dir);
+    let cargo_shim_exe = cargo_shim_dir.join("cargo.exe");
+    let merged_path = if existing_path.is_empty() {
+        shim_path
+    } else {
+        format!("{shim_path};{existing_path}")
+    };
+    vec![
+        ("CUPOLA_CLI".to_string(), cupola_path.clone()),
+        ("CUPOLA_BIN".to_string(), cupola_path.clone()),
+        ("CUPOLA_EXE".to_string(), cupola_path),
+        ("AEGIS_EXE".to_string(), path_to_string(aegis_bin)),
+        ("EPI_CLI".to_string(), path_to_string(epi_bin)),
+        ("CARGO".to_string(), path_to_string(&cargo_shim_exe)),
+        ("PATH".to_string(), merged_path.clone()),
+        ("Path".to_string(), merged_path),
+    ]
+}
+
 fn resolve_pdf_render_script(leo_root: &Path) -> Result<PathBuf> {
     let mut candidates = vec![normalize_lexical(&leo_root.join(PDF_RENDER_SCRIPT_REL))];
     if let Ok(cwd) = std::env::current_dir() {
@@ -1168,7 +1232,7 @@ fn execute_step(
     pack_dir: &Path,
 ) -> Result<RunStep> {
     execute_internal_step(spec, out_dir, logs_dir, pack_dir, |spec, stdout, stderr| {
-        let output = run_command_capture(&spec.cwd, &spec.argv)?;
+        let output = run_command_capture_with_env(&spec.cwd, &spec.argv, &spec.env)?;
         stdout.extend_from_slice(&output.stdout);
         stderr.extend_from_slice(&output.stderr);
         if output.status.success() {
@@ -1366,7 +1430,7 @@ fn execute_verify_pack_step(
             bail!("pack zip is missing");
         }
 
-        let output = run_command_capture(&spec.cwd, &spec.argv)?;
+        let output = run_command_capture_with_env(&spec.cwd, &spec.argv, &spec.env)?;
         stdout.extend_from_slice(&output.stdout);
         stderr.extend_from_slice(&output.stderr);
 
@@ -3288,21 +3352,31 @@ fn build_replay_commands(context: &BundleContext) -> Vec<String> {
 }
 
 fn run_command_capture(cwd: &Path, argv: &[String]) -> Result<std::process::Output> {
+    run_command_capture_with_env(cwd, argv, &[])
+}
+
+fn run_command_capture_with_env(
+    cwd: &Path,
+    argv: &[String],
+    env: &[(String, String)],
+) -> Result<std::process::Output> {
     let (program, args) = argv
         .split_first()
         .context("cannot execute empty command vector")?;
 
-    Command::new(program)
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .with_context(|| {
-            format!(
-                "failed to execute command in {}: {}",
-                cwd.display(),
-                format_command_for_replay(argv)
-            )
-        })
+    let mut command = Command::new(program);
+    command.args(args).current_dir(cwd);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+
+    command.output().with_context(|| {
+        format!(
+            "failed to execute command in {}: {}",
+            cwd.display(),
+            format_command_for_replay(argv)
+        )
+    })
 }
 
 fn probe_version(program: &Path, args: &[&str]) -> String {
@@ -3834,6 +3908,7 @@ mod tests {
                         path_to_string(&pack_zip),
                         "--json".to_string(),
                     ],
+                    env: Vec::new(),
                 },
                 &out_dir,
                 &logs_dir,

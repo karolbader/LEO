@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cupola.dev/contracts/v1/epi.decision_pack.v1.schema.json",
+  "title": "EPI Decision Pack v1",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": "epi.decision_pack.v1"
+    },
+    "generated_at": {
+      "type": "string",
+      "minLength": 1
+    },
+    "pack_meta": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "pack_type": {
+          "type": "string",
+          "minLength": 1
+        },
+        "library": {
+          "type": "string",
+          "minLength": 1
+        },
+        "client": {
+          "type": "string",
+          "minLength": 1
+        },
+        "engagement": {
+          "type": "string",
+          "minLength": 1
+        },
+        "pack_id": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "pack_type",
+        "library",
+        "client",
+        "engagement"
+      ]
+    },
+    "toolchain": {
+      "type": "object"
+    },
+    "artifacts": {
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version",
+    "generated_at",
+    "pack_meta",
+    "toolchain",
+    "artifacts"
+  ]
+}
+

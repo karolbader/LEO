@@ -1,81 +1,32 @@
 # LEO Portable Install (Windows)
 
-This layout runs `leo.exe` without requiring Rust toolchains or local source repos.
+## Customer Workflow
 
-## Expected Layout
+1. Unzip the portable `LEO` folder anywhere (`Desktop`, `Downloads`, `Temp`, network share, etc.).
+2. Open PowerShell in the folder that contains `leo.exe`.
+3. Run:
+   - `.\RUN_SELF_AUDIT.ps1`
 
-LEO resolves tools from the folder that contains `leo.exe`:
+If script policy blocks execution, run:
 
-- `tools\cupola\cupola-cli.exe`
-- `tools\epi\epi-cli.exe`
-- `tools\aegis\aegis.exe`
-- `tools\aegis\data\...` (Aegis control packs)
-- `config\leo.toml`
-- `data\intake.json`
-- `scripts\smoke_e2e.ps1`
+- `powershell -ExecutionPolicy Bypass -File .\RUN_SELF_AUDIT.ps1`
 
-Tool lookup order:
+`RUN_SELF_AUDIT.ps1` is the only required customer command. It:
 
-1. Embedded `tools\...` paths
-2. `config\leo.toml` (`cupola_bin`, `aegis_bin`, `epi_bin`)
-3. Environment variables: `CUPOLA_CLI`, `AEGIS_EXE`, `EPI_CLI`
-
-## Quick Start
-
-1. Unzip the portable folder.
-2. Open PowerShell in the folder containing `leo.exe`.
-3. Run `.\leo.exe doctor`.
-4. Run the quick smoke:
-   - `pwsh -File .\scripts\smoke_e2e.ps1`
-
-## Quick Smoke
-
-`smoke_e2e.ps1` performs a self-contained rail smoke:
-
-- creates a synthetic vault in `%TEMP%\leo-smoke\vault\...`
-- writes output to `%TEMP%\leo-smoke\run-...`
+- resolves all tool/input/output paths to absolute paths from the bundle root
 - runs `leo.exe doctor`
-- runs `leo.exe run --vault ... --intake .\data\intake.json --out ...`
-- runs `tools\epi\epi-cli.exe verify <out>\pack.zip --json`
+- runs `leo.exe run` with bundled `cupola-cli.exe`, `aegis.exe`, and `epi-cli.exe`
+- uses bundled verifier contracts from `contracts\v1`
+- prints the final `DecisionPack.html`, `DecisionPack.pdf`, `verify.json`, and `pack.zip` paths
 
-The script prints one line:
+## Expected Outputs
 
-- `PASS <verify-json>` on success
-- `FAIL <reason>` on failure (exit code non-zero)
+The run writes to `out\self-audit-<timestamp>\` and must produce:
 
-## Verify Output Pack (Manual)
-
-- `.\tools\epi\epi-cli.exe verify "<out>\pack.zip" --json`
-
-## Demo PDF Smoke
-
-Single command:
-
-- `pwsh -ExecutionPolicy Bypass -File E:\Sanctuary\products\leo\scripts\generate_demo_packs.ps1`
-
-This generates three demo outputs:
-
-- `E:\_packs\DEMO_vendorsecurity-v1_PACK-001`
-- `E:\_packs\DEMO_dfir-lite-v1_PACK-001`
-- `E:\_packs\DEMO_iso27001-lite-v1_PACK-001`
-
-Each output includes:
-
-- `pack.zip`
-- `verify.json`
-- `pack\epi.*.json`
 - `pack\<client>\<engagement>\PACK-001\DecisionPack.html`
-- `pack\<client>\<engagement>\PACK-001\DecisionPack.pdf`
-- `pack\<client>\<engagement>\PACK-001\SHA256.txt` (SHA256 of `DecisionPack.pdf`)
-
-## Notes
-
-- No network calls are required.
-- Deterministic pack behavior is unchanged.
-- Chromium PDF metadata fields may vary by render run:
-  - `/CreationDate`
-  - `/ModDate`
-  - document `/ID`
-- `SHA256.txt` records a hash of `DecisionPack.pdf`, but the PDF itself is not the integrity anchor.
-- Cryptographic source of truth is `pack.zip` + `epi.seal` + `verify.json` from `epi verify`.
+- `pack\<client>\<engagement>\PACK-001\DecisionPack.pdf` (`>= 50 KB`)
+- `pack\<client>\<engagement>\PACK-001\DecisionPack.manifest.json`
+- `pack\<client>\<engagement>\PACK-001\DecisionPack.seal.json`
+- `verify.json` with `ok=true`
+- `pack.zip` (verifiable with `epi-cli verify`)
 
