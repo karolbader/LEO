@@ -65,6 +65,7 @@ $leoExe = Join-Path $leoRepoResolved "target\release\leo.exe"
 $cargoShimExe = Join-Path $leoRepoResolved "target\release\cargo-shim.exe"
 $cupolaExe = Join-Path $cupolaRepoResolved "target\release\cupola-cli.exe"
 $epiExe = Join-Path $cupolaRepoResolved "target\release\epi-cli.exe"
+$viewerExe = Join-Path $leoProductsRoot "epi-viewer\src-tauri\target\release\epi-viewer.exe"
 $cupolaContractsV1 = Join-Path $cupolaRepoResolved "contracts\v1"
 $aegisExe = Join-Path $aegisRepoResolved "target\release\aegis.exe"
 $aegisData = Join-Path $aegisRepoResolved "data"
@@ -90,11 +91,15 @@ Require-Directory -Path $leoContractsV1 -Label "config\\contracts\\v1"
 Require-File -Path $smokeScript -Label "scripts\\smoke_e2e.ps1"
 Require-File -Path $selfAuditScript -Label "scripts\\RUN_SELF_AUDIT.ps1"
 Require-File -Path $cargoShimExe -Label "cargo-shim.exe"
+if (-not (Test-Path -LiteralPath $viewerExe -PathType Leaf)) {
+    throw "EPI Viewer executable is missing: $viewerExe`nBuild it first: cd ...\epi-viewer\src-tauri; cargo build --release"
+}
 
 $distRoot = Join-Path $leoRepoResolved "dist\LEO"
 $distToolsCupola = Join-Path $distRoot "tools\cupola"
 $distToolsCupolaRepoRelease = Join-Path $distToolsCupola "target\release"
 $distToolsEpi = Join-Path $distRoot "tools\epi"
+$distToolsViewer = Join-Path $distRoot "tools\viewer"
 $distToolsAegis = Join-Path $distRoot "tools\aegis"
 $distDocs = Join-Path $distRoot "docs"
 $distConfig = Join-Path $distRoot "config"
@@ -110,6 +115,7 @@ if (Test-Path -LiteralPath $distRoot) {
 New-Item -ItemType Directory -Path $distToolsCupola -Force | Out-Null
 New-Item -ItemType Directory -Path $distToolsCupolaRepoRelease -Force | Out-Null
 New-Item -ItemType Directory -Path $distToolsEpi -Force | Out-Null
+New-Item -ItemType Directory -Path $distToolsViewer -Force | Out-Null
 New-Item -ItemType Directory -Path $distToolsAegis -Force | Out-Null
 New-Item -ItemType Directory -Path $distDocs -Force | Out-Null
 New-Item -ItemType Directory -Path $distConfig -Force | Out-Null
@@ -123,6 +129,7 @@ Copy-Item -LiteralPath $cargoShimExe -Destination (Join-Path $distRoot "cargo.ex
 Copy-Item -LiteralPath $cupolaExe -Destination (Join-Path $distToolsCupola "cupola-cli.exe") -Force
 Copy-Item -LiteralPath $cupolaExe -Destination (Join-Path $distToolsCupolaRepoRelease "cupola-cli.exe") -Force
 Copy-Item -LiteralPath $epiExe -Destination (Join-Path $distToolsEpi "epi-cli.exe") -Force
+Copy-Item -LiteralPath $viewerExe -Destination (Join-Path $distToolsViewer "EPI_Viewer.exe") -Force
 Copy-Item -LiteralPath $aegisExe -Destination (Join-Path $distToolsAegis "aegis.exe") -Force
 Copy-Item -LiteralPath $aegisData -Destination $distToolsAegis -Recurse -Force
 Copy-Item -LiteralPath $cupolaContractsV1 -Destination $distContracts -Recurse -Force
